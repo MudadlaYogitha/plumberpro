@@ -141,7 +141,7 @@ const LandingPage = () => {
               <p className="text-gray-600">Dedicated support team to help you every step of the way</p>
             </div>
           </div>
-        </div>
+        
       </div>
 
       {/* Footer */}
@@ -155,10 +155,11 @@ const LandingPage = () => {
             Professional plumbing services at your fingertips
           </p>
           <div className="text-sm text-gray-500">
-            © 2024 PlumbPro. All rights reserved.
+            © 2025 PlumbPro. All rights reserved.
           </div>
         </div>
       </footer>
+    </div>
     </div>
   );
 };

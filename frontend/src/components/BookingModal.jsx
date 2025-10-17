@@ -181,10 +181,7 @@ const BookingModal = ({ booking, isOpen, onClose, onUpdate, userRole }) => {
                   <User className="w-4 h-4 text-gray-500 mr-2" />
                   <span>{booking.provider.name}</span>
                 </div>
-                <div className="flex items-center">
-                  <Phone className="w-4 h-4 text-gray-500 mr-2" />
-                  <span>{booking.provider.phone}</span>
-                </div>
+                
               </div>
             </div>
           )}

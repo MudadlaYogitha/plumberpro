@@ -238,7 +238,7 @@ const MyOrders = () => {
                           <div className="bg-blue-50 p-3 rounded-lg">
                             <p className="text-sm font-medium text-gray-900">Service Provider</p>
                             <p className="text-sm text-blue-700">{booking.provider.name || '—'}</p>
-                            <p className="text-xs text-blue-600">{booking.provider.phone || '—'}</p>
+                            
                           </div>
                         )}
 
