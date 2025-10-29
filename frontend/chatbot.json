@@ -1,0 +1,100 @@
+{
+  "name": "Booking with Calendar Selection",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "booking",
+        "options": {}
+      },
+      "id": "Webhook_1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "const { startTime, endTime } = $json;\nif (!startTime || !endTime) {\n  throw new Error('No startTime or endTime found in payload');\n}\nreturn [{ json: { startTime, endTime, ...$json } }];"
+      },
+      "id": "BuildIntervalISO",
+      "name": "BuildIntervalISO",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "url": "https://www.googleapis.com/calendar/v3/freeBusy",
+        "method": "POST",
+        "sendBody": true,
+        "jsonBody": true,
+        "bodyParametersJson": "{\n  \"timeMin\": \"={{$json[\\\"startTime\\\"]}}\",\n  \"timeMax\": \"={{$json[\\\"endTime\\\"]}}\",\n  \"timeZone\": \"Asia/Kolkata\",\n  \"items\": [\n    { \"id\": \"mudadlayogitha440@gmail.com\" },\n    { \"id\": \"myogitha712@gmail.com\" },\n    { \"id\": \"mudadlayogitha7@gmail.com\" }\n  ]\n}"
+      },
+      "id": "FreeBusyAll",
+      "name": "FreeBusy (all calendars)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [750, 300],
+      "credentials": {
+        "googleCalendarOAuth2Api": "Google Calendar OAuth"
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const freeBusy = $json;\nlet availableCalendar = null;\n\nconst order = [\n  'mudadlayogitha440@gmail.com',\n  'myogitha712@gmail.com',\n  'mudadlayogitha7@gmail.com'\n];\n\nfor (const id of order) {\n  const busy = freeBusy.calendars?.[id]?.busy;\n  if (!busy || busy.length === 0) {\n    availableCalendar = id;\n    break;\n  }\n}\n\nif (!availableCalendar) {\n  return [{ json: { ...$json, status: 'No availability' } }];\n}\n\nreturn [{ json: { ...$json, chosenCalendar: availableCalendar } }];"
+      },
+      "id": "ChooseCalendar",
+      "name": "Choose Available Calendar",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "calendar": "={{$json[\"chosenCalendar\"]}}",
+        "start": "={{$json[\"startTime\"]}}",
+        "end": "={{$json[\"endTime\"]}}",
+        "summary": "Booking",
+        "description": "New booking created",
+        "useDefaultReminders": true
+      },
+      "id": "CreateEvent",
+      "name": "Create Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "googleCalendarOAuth2Api": "Google Calendar OAuth"
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "return [{ json: {\n  fullName: $json.fullName,\n  address: $json.address,\n  contact: $json.contact,\n  email: $json.email,\n  startTime: $json.startTime,\n  endTime: $json.endTime,\n  calendar: $json.chosenCalendar || 'No availability'\n} }];"
+      },
+      "id": "ReturnConfirmation",
+      "name": "Return Confirmation",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1500, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "BuildIntervalISO", "type": "main", "index": 0 }]]
+    },
+    "BuildIntervalISO": {
+      "main": [[{ "node": "FreeBusy (all calendars)", "type": "main", "index": 0 }]]
+    },
+    "FreeBusy (all calendars)": {
+      "main": [[{ "node": "Choose Available Calendar", "type": "main", "index": 0 }]]
+    },
+    "Choose Available Calendar": {
+      "main": [[{ "node": "Create Event", "type": "main", "index": 0 }]]
+    },
+    "Create Event": {
+      "main": [[{ "node": "Return Confirmation", "type": "main", "index": 0 }]]
+    }
+  }
+}

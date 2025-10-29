@@ -4,13 +4,38 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Plumbing Booking System</title>
+    <title>Plumbing Booking System — Plumber Booking Chatbot</title>
+
+    <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+      /* minimal fallback styling for pages without React-mounted content */
+      html, body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        font-family: 'Inter', Arial, sans-serif;
+        background: #ffffff;
+        color: #333333;
+      }
+
+      /* ensure the chat widget container (if it injects one) doesn't clash with #root */
+      #root {
+        min-height: 100vh;
+      }
+    </style>
   </head>
+
   <body>
     <div id="root"></div>
+
+    <!-- React app entry (Vite) -->
     <script type="module" src="/src/main.jsx"></script>
+
+    
   </body>
 </html>
