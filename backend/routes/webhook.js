@@ -190,7 +190,7 @@ router.post('/webhook', async (req, res) => {
       session.state = 'awaiting_phone';
       await session.save();
 
-      replyText = "Hi — I don't have your phone number. Please reply with your phone number (digits only, e.g. 915886543219) so we can continue with the booking. Also briefly tell us what service you need (optional) — e.g. 'plumbing'.";
+      replyText = "Hi, Please fill top placeholder with your phone number (digits only, e.g. 915886543219) so we can continue with the booking.";
 
       // persist outgoing reply SMS record
       await saveOutgoing(session.phone, replyText);
