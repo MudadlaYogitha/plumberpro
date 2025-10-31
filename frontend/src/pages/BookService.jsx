@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import Layout from '../components/Layout';
 import { toast } from 'react-hot-toast';
 import axios from 'axios';
@@ -15,20 +15,28 @@ import {
   Clock,
   Upload,
   X,
-  Eye
+  Eye,
+  ExternalLink,
+  MessageCircle
 } from 'lucide-react';
 
 const BookService = () => {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const [step, setStep] = useState(1);
+  const [searchParams] = useSearchParams();
   const [loading, setLoading] = useState(false);
   const [uploadingFiles, setUploadingFiles] = useState(false);
+  
+  // Get SMS booking parameters
+  const smsPhone = searchParams.get('phone');
+  const sessionId = searchParams.get('session');
+  const refSource = searchParams.get('ref');
+  const isSMSBooking = refSource === 'sms' && smsPhone && sessionId;
   
   const [formData, setFormData] = useState({
     customerName: user?.name || '',
     customerEmail: user?.email || '',
-    customerPhone: user?.phone || '',
+    customerPhone: smsPhone || user?.phone || '',
     address: user?.address || '',
     serviceType: '',
     description: '',
@@ -39,9 +47,19 @@ const BookService = () => {
 
   const [showConfirmation, setShowConfirmation] = useState(false);
 
+  useEffect(() => {
+    if (isSMSBooking) {
+      // Prefill phone number from SMS
+      setFormData(prev => ({
+        ...prev,
+        customerPhone: smsPhone
+      }));
+    }
+  }, [isSMSBooking, smsPhone]);
+
   const serviceTypes = [
     'Pipe Repair',
-    'Leak Fixing',
+    'Leak Fixing', 
     'Drain Cleaning',
     'Water Heater',
     'Toilet Repair',
@@ -144,26 +162,66 @@ const BookService = () => {
     setLoading(true);
     
     try {
-      await axios.post(`${import.meta.env.VITE_API_URL}/bookings`, formData);
+      let bookingData = { ...formData };
+
+      if (isSMSBooking) {
+        // Use SMS booking endpoint
+        bookingData = {
+          ...bookingData,
+          phone: smsPhone,
+          sessionId: sessionId
+        };
+        
+        await axios.post(`${import.meta.env.VITE_API_URL}/bookings/sms-booking`, bookingData);
+      } else {
+        // Use regular booking endpoint
+        await axios.post(`${import.meta.env.VITE_API_URL}/bookings`, bookingData);
+      }
       
       toast.success('Booking created successfully!');
-      navigate('/customer');
+      
+      if (isSMSBooking) {
+        // Show success with SMS instructions
+        setShowConfirmation(false);
+        setShowSMSSuccess(true);
+      } else {
+        navigate('/customer');
+      }
     } catch (error) {
       console.error('Booking error:', error);
       toast.error(error.response?.data?.message || 'Failed to create booking');
     } finally {
       setLoading(false);
-      setShowConfirmation(false);
     }
   };
+
+  const [showSMSSuccess, setShowSMSSuccess] = useState(false);
 
   const selectedTimeSlot = timeSlots.find(
     slot => slot.start === formData.timeSlot.start && slot.end === formData.timeSlot.end
   );
 
   return (
-    <Layout title="Book Service">
+    <Layout title={isSMSBooking ? "Book Service via SMS" : "Book Service"}>
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* SMS Booking Header */}
+        {isSMSBooking && (
+          <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+            <div className="flex items-center">
+              <MessageCircle className="w-6 h-6 text-blue-600 mr-3" />
+              <div>
+                <h3 className="text-lg font-semibold text-blue-900">SMS Booking</h3>
+                <p className="text-sm text-blue-700">
+                  Booking for phone: <span className="font-mono font-medium">{smsPhone}</span>
+                </p>
+                <p className="text-xs text-blue-600 mt-1">
+                  After booking, you can login to track your order. We'll send you updates via SMS too!
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="card">
           <form onSubmit={handleProceedToBook} className="space-y-8">
             {/* Contact Information */}
@@ -205,8 +263,12 @@ const BookService = () => {
                       required
                       className="input-field pl-11"
                       placeholder="Enter your phone number"
+                      readOnly={isSMSBooking}
                     />
                   </div>
+                  {isSMSBooking && (
+                    <p className="text-xs text-gray-500 mt-1">Phone number from SMS booking</p>
+                  )}
                 </div>
               </div>
 
@@ -441,6 +503,36 @@ const BookService = () => {
               </div>
             </div>
 
+            {/* Login/Signup Info for SMS users */}
+            {isSMSBooking && (
+              <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+                <h4 className="font-medium text-green-900 mb-2">Track Your Order Online</h4>
+                <p className="text-sm text-green-700 mb-3">
+                  After booking, you can create an account to track your order status, view updates, and manage future bookings.
+                </p>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <a
+                    href="/login"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center px-3 py-2 text-sm bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                  >
+                    <ExternalLink className="w-4 h-4 mr-1" />
+                    Login to Existing Account
+                  </a>
+                  <a
+                    href="/register"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center px-3 py-2 text-sm bg-white text-green-700 border border-green-300 rounded-lg hover:bg-green-50 transition-colors"
+                  >
+                    <ExternalLink className="w-4 h-4 mr-1" />
+                    Create New Account
+                  </a>
+                </div>
+              </div>
+            )}
+
             {/* Submit Button */}
             <div className="flex justify-end">
               <button
@@ -499,6 +591,15 @@ const BookService = () => {
                         </p>
                       </div>
                     )}
+
+                    {isSMSBooking && (
+                      <div className="bg-blue-50 p-3 rounded-lg">
+                        <p className="text-sm font-medium text-blue-900">SMS Booking</p>
+                        <p className="text-xs text-blue-700">
+                          This booking was initiated via SMS. You'll receive updates on your phone and can track online.
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex space-x-4">
@@ -517,6 +618,56 @@ const BookService = () => {
                       Confirm Booking
                     </button>
                   </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* SMS Success Modal */}
+          {showSMSSuccess && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+              <div className="bg-white rounded-xl shadow-xl max-w-lg w-full">
+                <div className="p-6 text-center">
+                  <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                    <MessageCircle className="w-8 h-8 text-green-600" />
+                  </div>
+                  
+                  <h3 className="text-xl font-semibold text-gray-900 mb-2">Booking Confirmed! 🎉</h3>
+                  <p className="text-gray-600 mb-6">
+                    Your plumbing service has been booked successfully. We'll send you SMS updates and notifications.
+                  </p>
+                  
+                  <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-6">
+                    <h4 className="font-medium text-green-900 mb-2">What's Next?</h4>
+                    <ul className="text-sm text-green-700 text-left space-y-1">
+                      <li>✅ Our certified plumbers will review your request</li>
+                      <li>✅ You'll get an SMS when a plumber accepts</li>
+                      <li>✅ Track everything online by creating an account</li>
+                      <li>✅ Get real-time updates via SMS</li>
+                    </ul>
+                  </div>
+
+                  <div className="flex flex-col gap-3">
+                    <a
+                      href="/register"
+                      className="btn-primary"
+                    >
+                      Create Account to Track Online
+                    </a>
+                    <button
+                      onClick={() => {
+                        setShowSMSSuccess(false);
+                        navigate('/');
+                      }}
+                      className="btn-secondary"
+                    >
+                      Done - I'll Track via SMS
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-gray-500 mt-4">
+                    You can close this page now. We'll keep you updated via SMS to {smsPhone}
+                  </p>
                 </div>
               </div>
             </div>

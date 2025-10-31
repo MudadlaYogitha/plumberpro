@@ -1,19 +1,20 @@
-// routes/webhook.js
 const express = require('express');
-const axios = require('axios'); // kept in case you want to forward externally later
+const axios = require('axios');
 const SMS = require('../models/SMS');
 const Session = require('../models/Session');
+const Booking = require('../models/Booking');
+const User = require('../models/User');
 const { Types: { ObjectId } } = require('mongoose');
 
 const router = express.Router();
 
-const BOOKING_LINK = 'https://plumberpro-seven.vercel.app/';
+const BOOKING_LINK = process.env.FRONTEND_URL || 'http://localhost:5173';
 const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER || 'System';
 
-// canonical service list (use lowercase when matching)
+// Canonical service list (use lowercase when matching)
 const SERVICES = [
-  'plumbing',            // general plumbing (leaks, clogs, taps)
-  'drain cleaning',
+  'plumbing',
+  'drain cleaning', 
   'water heater',
   'geyser',
   'pipe repair',
@@ -24,22 +25,22 @@ const SERVICES = [
   'other'
 ];
 
-// helper: normalize incoming text
+// Helper: normalize incoming text
 function cleanText(text) {
   if (!text || typeof text !== 'string') return '';
   return text.trim();
 }
 
-// helper: do simple intent checks
+// Helper: do simple intent checks
 function includesAny(text, words) {
   const t = (text || '').toLowerCase();
   return words.some(w => t.includes(w));
 }
 
-// canonicalize service name from user text (attempt)
+// Canonicalize service name from user text
 function detectService(text) {
   const t = (text || '').toLowerCase();
-  // direct exact matches & shortcuts
+  
   if (t.includes('plumb')) return 'Plumbing';
   if (t.includes('drain')) return 'Drain cleaning';
   if (t.includes('geyser') || t.includes('water heater')) return 'Water heater';
@@ -47,7 +48,7 @@ function detectService(text) {
   if (t.includes('bath') || t.includes('bathroom') || t.includes('fitting')) return 'Bathroom fitting / installation';
   if (t.includes('electr') || t.includes('socket') || t.includes('switch')) return 'Electrical (minor)';
   if (t.includes('other')) return 'Other';
-  // fallback: check each service phrase
+  
   for (const s of SERVICES) {
     if (t.includes(s)) return capitalizeService(s);
   }
@@ -55,7 +56,6 @@ function detectService(text) {
 }
 
 function capitalizeService(s) {
-  // some formatting
   if (!s) return s;
   if (s === 'water heater') return 'Water heater / geyser';
   if (s === 'pipe repair') return 'Pipe repair / replacement';
@@ -68,17 +68,15 @@ function capitalizeService(s) {
   return s[0].toUpperCase() + s.slice(1);
 }
 
-// Create or update session for phone, returns session doc
+// Create or update session for phone
 async function getOrCreateSession(phone) {
-  const sessionId = new ObjectId().toString(); // unique id
-  // try find existing session by phone
+  const sessionId = new ObjectId().toString();
   let session = await Session.findOne({ phone });
   if (!session) {
     session = new Session({ phone, sessionId, state: 'new' });
     await session.save();
     return session;
   }
-  // if existing session doesn't have sessionId (rare), set it
   if (!session.sessionId) {
     session.sessionId = sessionId;
     await session.save();
@@ -100,11 +98,7 @@ async function saveOutgoing(phone, text) {
   return out;
 }
 
-/**
- * Heuristic: extract digits from text and return normalized phone string if plausible,
- * otherwise return null.
- * Accepts numbers of length 10..15 (basic).
- */
+// Extract digits from text and return normalized phone string
 function extractPhoneDigits(text) {
   if (!text || typeof text !== 'string') return null;
   const digits = (text.match(/\d+/g) || []).join('');
@@ -112,18 +106,12 @@ function extractPhoneDigits(text) {
   return null;
 }
 
-/**
- * Create a guest id for anonymous chats
- * e.g. guest_ab12cd34
- */
+// Create a guest id for anonymous chats
 function makeGuestId() {
   return `guest_${new ObjectId().toString().slice(-8)}`;
 }
 
-/**
- * Move all SMS documents from oldFrom -> newFrom.
- * Returns { modifiedCount } (Mongo update result) or null on error.
- */
+// Move all SMS documents from oldFrom -> newFrom
 async function reassignSmsFrom(oldFrom, newFrom) {
   try {
     const res = await SMS.updateMany({ from: oldFrom }, { $set: { from: newFrom } });
@@ -134,357 +122,392 @@ async function reassignSmsFrom(oldFrom, newFrom) {
   }
 }
 
-// POST /api/sms/webhook
+// Generate unique booking link with phone number
+function generateBookingLink(phone, sessionId) {
+  const encodedPhone = encodeURIComponent(phone);
+  const encodedSession = encodeURIComponent(sessionId);
+  return `${BOOKING_LINK}/book-service?phone=${encodedPhone}&session=${encodedSession}&ref=sms`;
+}
+
+// Send SMS via external API (if configured)
+async function sendSMS(to, message) {
+  if (!process.env.SENSOR_API_KEY || !process.env.SENSOR_API_BASE_URL) {
+    console.warn('SMS API not configured, skipping actual SMS send');
+    return { success: true, messageId: `mock_${Date.now()}` };
+  }
+
+  try {
+    const apiUrl = `${process.env.SENSOR_API_BASE_URL}/services/send-message.php`;
+    const params = {
+      key: process.env.SENSOR_API_KEY,
+      number: to,
+      message: message,
+      devices: '2',
+      type: 'sms',
+      prioritize: '1'
+    };
+
+    const response = await axios.post(apiUrl, null, { params });
+    return {
+      success: response.data.success || true,
+      messageId: response.data.messageId || `sent_${Date.now()}`
+    };
+  } catch (error) {
+    console.error('SMS send error:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+// Main webhook endpoint - handles the new schema format
 router.post('/webhook', async (req, res) => {
   try {
-    // Accept message always; phone is optional now (to support anonymous/chat widget)
-    const { message } = req.body ?? {};
-    let { phone } = req.body ?? {};
+    console.log('Webhook received:', JSON.stringify(req.body, null, 2));
 
-    if (!message) {
+    let messages = [];
+    
+    // Handle both array and single message formats
+    if (Array.isArray(req.body)) {
+      messages = req.body;
+    } else if (req.body.message && req.body.number) {
+      // Handle direct format {message, phone}
+      messages = [{
+        message: req.body.message,
+        number: req.body.phone || req.body.number
+      }];
+    } else {
       return res.status(400).json({
         success: false,
-        error: '"message" field is required in the request body'
+        error: 'Invalid webhook payload format'
       });
     }
 
-    const cleanMsg = cleanText(message);
-    // declare lower once and reuse
-    const lower = cleanMsg.toLowerCase();
+    const results = [];
 
-    // If phone is missing or explicitly set to 'unknown' (or empty), create or use a guest id
-    let isGuest = false;
-    if (!phone || String(phone).trim().toLowerCase() === 'unknown' || String(phone).trim() === '') {
-      isGuest = true;
-      phone = makeGuestId();
-    } else {
-      phone = String(phone).trim();
-    }
+    for (const msgData of messages) {
+      try {
+        // Extract message and phone from the new schema format
+        const message = msgData.message;
+        const phone = msgData.number;
 
-    const from = phone;
-    const to = process.env.SMS_SYSTEM_NUMBER || 'system';
-
-    // Save incoming SMS (mark 'from' as guest or phone; we'll update if we later learn the real phone)
-    const smsDoc = new SMS({
-      from,
-      to,
-      message: cleanMsg,
-      type: 'received',
-      status: 'received',
-      messageId: `recv_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-      webhookData: { receivedBody: req.body, headers: req.headers }
-    });
-    await smsDoc.save();
-
-    // Get or create session for this phone (guest or real)
-    let session = await getOrCreateSession(from);
-
-    // single reply variable used throughout
-    let replyText = null;
-
-    /**
-     * PART A: If this is a guest session which hasn't been asked for phone yet,
-     * ask for phone and stop here.
-     */
-    if (session.phone && session.phone.startsWith('guest_') && session.state !== 'awaiting_phone') {
-      session.state = 'awaiting_phone';
-      await session.save();
-
-      replyText = "Hi, Please fill top placeholder with your phone number (digits only, e.g. 915886543219) so we can continue with the booking.";
-
-      // persist outgoing reply SMS record
-      await saveOutgoing(session.phone, replyText);
-
-      return res.status(200).json({
-        success: true,
-        message: 'SMS received and processed (awaiting phone)',
-        data: {
-          id: smsDoc._id,
-          from: smsDoc.from,
-          to: smsDoc.to,
-          message: smsDoc.message,
-          createdAt: smsDoc.createdAt
-        },
-        agent: {
-          reply: replyText,
-          session: {
-            phone: session.phone,
-            sessionId: session.sessionId,
-            state: session.state,
-            service: session.service || null
-          },
-          outgoingSmsId: null
+        if (!message) {
+          results.push({
+            success: false,
+            error: 'Message field is required',
+            msgData
+          });
+          continue;
         }
-      });
-    }
 
-    /**
-     * PART B: If we are awaiting phone (user was asked) -> check if this message contains phone digits.
-     * If yes, migrate/merge conversation and continue.
-     */
-    if (session.state === 'awaiting_phone') {
-      const possiblePhone = extractPhoneDigits(cleanMsg);
-      if (possiblePhone) {
-        const normalizedPhone = possiblePhone;
-
-        // check if there is already a session for this real phone
-        let existing = await Session.findOne({ phone: normalizedPhone });
-
-        if (existing) {
-          // Merge guest -> existing:
-          // 1) Reassign all SMS docs that have from == guest_id to normalizedPhone
-          // 2) Delete the guest session record to avoid orphan sessions (optional)
-          // 3) Use the existing session going forward
-          try {
-            const reassignRes = await reassignSmsFrom(session.phone, normalizedPhone);
-            if (reassignRes) {
-              console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${session.phone} -> ${normalizedPhone}`);
-            }
-          } catch (e) {
-            console.warn('Failed to reassign SMS docs to existing session phone', e);
-          }
-
-          try {
-            // delete guest session record
-            await Session.deleteOne({ _id: session._id });
-          } catch (e) {
-            console.warn('Failed to delete guest session after merge', e);
-          }
-
-          session = existing;
-          replyText = `Thanks — we've attached this chat to your phone ${normalizedPhone}. Resuming your existing session. How can we help?`;
-
+        const cleanMsg = cleanText(message);
+        const lower = cleanMsg.toLowerCase();
+        
+        // Normalize phone number or create guest ID
+        let normalizedPhone = phone;
+        let isGuest = false;
+        
+        if (!phone || String(phone).trim().toLowerCase() === 'unknown' || String(phone).trim() === '') {
+          isGuest = true;
+          normalizedPhone = makeGuestId();
         } else {
-          // No existing session: update this guest session to become the real phone session
-          const oldGuest = session.phone;
-          session.phone = normalizedPhone;
+          normalizedPhone = String(phone).replace(/\D/g, ''); // Remove non-digits
+        }
+
+        const from = normalizedPhone;
+        const to = process.env.SMS_SYSTEM_NUMBER || 'system';
+
+        // Save incoming SMS
+        const smsDoc = new SMS({
+          from,
+          to,
+          message: cleanMsg,
+          type: 'received',
+          status: 'received',
+          messageId: msgData.ID ? `recv_${msgData.ID}` : `recv_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+          deviceId: msgData.deviceID,
+          webhookData: msgData
+        });
+        await smsDoc.save();
+
+        // Get or create session
+        let session = await getOrCreateSession(from);
+        let replyText = null;
+
+        // PART A: Guest session - ask for phone
+        if (session.phone && session.phone.startsWith('guest_') && session.state !== 'awaiting_phone') {
+          session.state = 'awaiting_phone';
+          await session.save();
+
+          replyText = "Hi! I'm your PlumbPro assistant. To help you book a service, please reply with your phone number (e.g., 9123456789) so I can create a personalized booking link for you.";
+          
+          const outgoing = await saveOutgoing(session.phone, replyText);
+          
+          results.push({
+            success: true,
+            message: 'SMS received and processed (awaiting phone)',
+            data: {
+              id: smsDoc._id,
+              from: smsDoc.from,
+              to: smsDoc.to,
+              message: smsDoc.message,
+              reply: replyText
+            }
+          });
+          continue;
+        }
+
+        // PART B: Awaiting phone - process phone number
+        if (session.state === 'awaiting_phone') {
+          const possiblePhone = extractPhoneDigits(cleanMsg);
+          if (possiblePhone) {
+            const normalizedNewPhone = possiblePhone;
+
+            // Check if session exists for this real phone
+            let existing = await Session.findOne({ phone: normalizedNewPhone });
+
+            if (existing) {
+              // Merge guest -> existing session
+              try {
+                const reassignRes = await reassignSmsFrom(session.phone, normalizedNewPhone);
+                if (reassignRes) {
+                  console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${session.phone} -> ${normalizedNewPhone}`);
+                }
+              } catch (e) {
+                console.warn('Failed to reassign SMS docs to existing session phone', e);
+              }
+
+              try {
+                await Session.deleteOne({ _id: session._id });
+              } catch (e) {
+                console.warn('Failed to delete guest session after merge', e);
+              }
+
+              session = existing;
+              replyText = `Great! I've linked this chat to your phone ${normalizedNewPhone}. How can I help you today? Just say "I need help" or "book service" to get started.`;
+
+            } else {
+              // Update guest session to real phone session
+              const oldGuest = session.phone;
+              session.phone = normalizedNewPhone;
+              session.state = 'new';
+              await session.save();
+
+              try {
+                const reassignRes = await reassignSmsFrom(oldGuest, normalizedNewPhone);
+                if (reassignRes) {
+                  console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${oldGuest} -> ${normalizedNewPhone}`);
+                }
+              } catch (e) {
+                console.warn('Failed to reassign SMS docs from guest to new phone', e);
+              }
+
+              try {
+                smsDoc.from = normalizedNewPhone;
+                await smsDoc.save();
+              } catch (e) {
+                console.warn('Failed to update smsDoc.from to normalized phone', e);
+              }
+
+              replyText = `Perfect! Your phone number ${normalizedNewPhone} is saved. Which service do you need? For example: Plumbing, Drain cleaning, Water heater, Pipe repair, Bathroom fitting, Electrical, or Other.`;
+            }
+
+            const out = await saveOutgoing(session.phone, replyText);
+            
+            results.push({
+              success: true,
+              message: 'Phone received and processed',
+              data: {
+                id: smsDoc._id,
+                from: smsDoc.from,
+                to: smsDoc.to,
+                message: smsDoc.message,
+                reply: replyText
+              }
+            });
+            continue;
+
+          } else {
+            replyText = "Please enter a valid phone number (digits only, e.g., 9123456789) so I can create your booking link.";
+            await saveOutgoing(session.phone, replyText);
+            
+            results.push({
+              success: true,
+              message: 'Awaiting valid phone number',
+              data: {
+                id: smsDoc._id,
+                from: smsDoc.from,
+                to: smsDoc.to,
+                message: smsDoc.message,
+                reply: replyText
+              }
+            });
+            continue;
+          }
+        }
+
+        // PART C: Normal flow for sessions with real phone numbers
+        
+        // Emergency handling
+        if (includesAny(lower, ['emergency', 'urgent', 'help now', 'immediately'])) {
+          replyText = "🚨 If this is an emergency, please call our 24/7 emergency line: (555) PLUMBER. For non-urgent requests, I can help you book a service right away!";
           session.state = 'new';
           await session.save();
-
-          // Reassign previous SMS messages from guest to normalized phone
-          try {
-            const reassignRes = await reassignSmsFrom(oldGuest, normalizedPhone);
-            if (reassignRes) {
-              console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${oldGuest} -> ${normalizedPhone}`);
-            }
-          } catch (e) {
-            console.warn('Failed to reassign SMS docs from guest to new phone', e);
-          }
-
-          // Update the incoming message record's from field to the normalized phone
-          try {
-            smsDoc.from = normalizedPhone;
-            await smsDoc.save();
-          } catch (e) {
-            console.warn('Failed to update smsDoc.from to normalized phone', e);
-          }
-
-          replyText = `Thanks — your phone number ${normalizedPhone} is saved. Which service do you need right now? For example: Plumbing, Drain cleaning, Water heater, Pipe repair, Bathroom fitting, Electrical, Other.`;
         }
 
-        // persist outgoing reply record
-        const out = await saveOutgoing(normalizedPhone, replyText);
-
-        return res.status(200).json({
-          success: true,
-          message: 'Phone received and processed',
-          data: {
-            id: smsDoc._id,
-            from: smsDoc.from,
-            to: smsDoc.to,
-            message: smsDoc.message,
-            createdAt: smsDoc.createdAt
-          },
-          agent: {
-            reply: replyText,
-            session: {
-              phone: session.phone,
-              sessionId: session.sessionId,
-              state: session.state,
-              service: session.service || null
-            },
-            outgoingSmsId: out ? out._id : null
-          }
-        });
-      } else {
-        // The user did not provide a valid-looking phone when asked — remind them
-        replyText = "Please enter your phone number in top placeholder so we can continue (e.g. 915886543219). If you prefer, include country code.";
-        await saveOutgoing(session.phone, replyText);
-
-        return res.status(200).json({
-          success: true,
-          message: 'Awaiting valid phone number',
-          data: {
-            id: smsDoc._id,
-            from: smsDoc.from,
-            to: smsDoc.to,
-            message: smsDoc.message,
-            createdAt: smsDoc.createdAt
-          },
-          agent: {
-            reply: replyText,
-            session: {
-              phone: session.phone,
-              sessionId: session.sessionId,
-              state: session.state,
-              service: session.service || null
-            },
-            outgoingSmsId: null
-          }
-        });
-      }
-    }
-
-    /**
-     * PART C: Normal flow for sessions that already have a real phone (or after merge)
-     */
-    // Main flow logic
-    // Emergency handling
-    if (includesAny(lower, ['emergency', 'urgent', 'help now', 'immediately'])) {
-      replyText = "If this is an emergency, please call our emergency line immediately."; // add number if you have one
-      session.state = 'new';
-      await session.save();
-    }
-
-    // If user wants to cancel
-    else if (lower === 'cancel' || lower === 'stop') {
-      session.state = 'cancelled';
-      await session.save();
-      replyText = "Your request has been cancelled. If you need anything else, message us.";
-    }
-
-    // If user asks for pricing
-    else if (includesAny(lower, ['price', 'pricing', 'cost', 'how much'])) {
-      replyText = "Pricing varies by service and location; please use the booking form to request a quote: " + BOOKING_LINK;
-      session.state = 'link_sent';
-      session.service = session.service || null;
-      await session.save();
-      await saveOutgoing(session.phone, replyText);
-    }
-
-    // If session is new and user expresses need for help/book
-    else if ((session.state === 'new' || !session.state) && includesAny(lower, ['help', 'need', 'book', 'plumber', 'plumbing', 'i need', 'i want'])) {
-      // ask for service selection
-      replyText = "Which service do you need right now? Choose one:\n- Plumbing (leaks, clogs, taps)\n- Drain cleaning\n- Water heater / geyser\n- Pipe repair / replacement\n- Bathroom fitting / installation\n- Electrical (minor)\n- Other";
-      session.state = 'awaiting_service';
-      session.service = null;
-      await session.save();
-    }
-
-    // If waiting for the user to pick a service
-    else if (session.state === 'awaiting_service') {
-      // Detect chosen service
-      const detected = detectService(cleanMsg);
-      if (detected) {
-        // If user selected Other specifically
-        if (detected.toLowerCase().includes('other')) {
-          session.state = 'awaiting_other_desc';
+        // Cancel/stop
+        else if (lower === 'cancel' || lower === 'stop') {
+          session.state = 'cancelled';
           await session.save();
-          replyText = "Please briefly describe the problem.";
-        } else {
-          // confirm chosen service and send link
-          const serviceLabel = detected;
+          replyText = "Your request has been cancelled. If you need plumbing services in the future, just text me anytime. Have a great day! 👋";
+        }
+
+        // Pricing inquiry
+        else if (includesAny(lower, ['price', 'pricing', 'cost', 'how much', 'rate', 'charge'])) {
+          const bookingLink = generateBookingLink(session.phone, session.sessionId);
+          replyText = `Our pricing varies by service type and complexity. To get an accurate quote, please use your personalized booking form: ${bookingLink}\n\nOur certified plumbers will provide a detailed quote before starting any work. No surprises! 💰`;
           session.state = 'link_sent';
-          session.service = serviceLabel;
+          await session.save();
+        }
+
+        // Main help/booking request
+        else if ((session.state === 'new' || !session.state) && includesAny(lower, ['help', 'need', 'book', 'plumber', 'plumbing', 'i need', 'i want', 'service', 'repair', 'fix'])) {
+          replyText = `I'm here to help! 🔧 Which plumbing service do you need?\n\n• Plumbing (leaks, clogs, taps)\n• Drain cleaning\n• Water heater / geyser\n• Pipe repair / replacement\n• Bathroom fitting / installation\n• Electrical (minor)\n• Other\n\nJust reply with the service type you need!`;
+          session.state = 'awaiting_service';
+          session.service = null;
+          await session.save();
+        }
+
+        // Waiting for service selection
+        else if (session.state === 'awaiting_service') {
+          const detected = detectService(cleanMsg);
+          if (detected) {
+            if (detected.toLowerCase().includes('other')) {
+              session.state = 'awaiting_other_desc';
+              await session.save();
+              replyText = "Please briefly describe the plumbing issue you're experiencing. The more details you provide, the better we can help! 📝";
+            } else {
+              session.state = 'link_sent';
+              session.service = detected;
+              await session.save();
+
+              const bookingLink = generateBookingLink(session.phone, session.sessionId);
+              replyText = `Excellent! ${detected} service selected. 🎯\n\nPlease complete your booking using this secure link:\n${bookingLink}\n\n✅ Quick & easy form\n✅ Choose your preferred time\n✅ Upload photos if needed\n✅ Get instant confirmation\n\nAfter booking, you can track everything online!`;
+            }
+          } else {
+            replyText = "I didn't quite catch that. Please choose from:\n\n• Plumbing\n• Drain cleaning\n• Water heater\n• Pipe repair\n• Bathroom fitting\n• Electrical\n• Other\n\nJust type the service you need! 🔧";
+          }
+        }
+
+        // Handle "other" description
+        else if (session.state === 'awaiting_other_desc') {
+          session.service = `Other: ${cleanMsg}`;
+          session.state = 'link_sent';
           await session.save();
 
-          replyText = `Great — ${serviceLabel} selected. Please fill this short booking form so we can schedule: ${BOOKING_LINK}`;
-
-          // persist outgoing reply SMS record
-          await saveOutgoing(session.phone, replyText);
+          const bookingLink = generateBookingLink(session.phone, session.sessionId);
+          replyText = `Got it! I've noted your request: "${cleanMsg}" 📝\n\nComplete your booking here:\n${bookingLink}\n\nOur expert plumbers will review your specific needs and provide the best solution!`;
         }
-      } else {
-        // If user replied but we couldn't map to a service, ask again briefly
-        replyText = "Sorry, I didn't recognise that service. Please choose one of: Plumbing, Drain cleaning, Water heater, Pipe repair, Bathroom fitting, Electrical, Other.";
-      }
-    }
 
-    // If user provided "other" description
-    else if (session.state === 'awaiting_other_desc') {
-      // Accept user's description, then send link
-      session.service = cleanMsg;
-      session.state = 'link_sent';
-      await session.save();
+        // Link sent - waiting for form completion
+        else if (session.state === 'link_sent') {
+          if (includesAny(lower, ['done', 'submitted', 'completed', 'filled', 'finished', 'sent'])) {
+            session.state = 'submitted';
+            await session.save();
 
-      replyText = `Thanks — noted. Please fill this short booking form so we can schedule: ${BOOKING_LINK}`;
-      await saveOutgoing(session.phone, replyText);
-    }
+            replyText = `🎉 Fantastic! Your booking request has been received.\n\n✅ Our certified plumbers will review your request\n✅ You'll receive an acceptance notification soon\n✅ Track progress at: ${BOOKING_LINK}/login\n\nThank you for choosing PlumbPro! 🔧`;
+          } else if (includesAny(lower, ['not yet', 'not done', 'haven\'t', 'no', 'still working'])) {
+            const bookingLink = generateBookingLink(session.phone, session.sessionId);
+            replyText = `No worries! Take your time. Your booking link is always ready:\n${bookingLink}\n\nJust reply "Done" when you've completed the form! 👍`;
+          } else if (includesAny(lower, ['link', 'form', 'booking', 'again', 'resend'])) {
+            const bookingLink = generateBookingLink(session.phone, session.sessionId);
+            replyText = `Here's your booking link again:\n${bookingLink}\n\nReply "Done" after you've filled out the form! 📋`;
+          } else {
+            const bookingLink = generateBookingLink(session.phone, session.sessionId);
+            replyText = `Please complete your booking form: ${bookingLink}\n\n💡 After filling it out, reply "Done" and I'll confirm everything is set! Need the link again? Just ask!`;
+          }
+        }
 
-    // If link has been sent and we are waiting for confirmation from user that form submitted
-    else if (session.state === 'link_sent') {
-      // user says done/submitted
-      if (includesAny(lower, ['done', 'submitted', 'i submitted', 'i did', 'finished'])) {
-        session.state = 'submitted';
+        // Already submitted - status inquiries
+        else if (session.state === 'submitted') {
+          if (includesAny(lower, ['status', 'update', 'when', 'accepted', 'progress', 'news'])) {
+            replyText = `⏳ Your booking is being reviewed by our team. You'll get a notification once a plumber accepts your request!\n\n📱 Track live updates: ${BOOKING_LINK}/login\n\nUsually takes 30-60 minutes during business hours.`;
+          } else {
+            replyText = `Your booking request is submitted! 🎯\n\n📱 Track status: ${BOOKING_LINK}/login\n💬 Get updates here automatically\n🔧 Our plumbers are reviewing your request\n\nNeed help with something else?`;
+          }
+        }
+
+        // Fallback - try to detect direct service mention
+        else {
+          const directService = detectService(cleanMsg);
+          if (directService) {
+            session.state = 'link_sent';
+            session.service = directService;
+            await session.save();
+            
+            const bookingLink = generateBookingLink(session.phone, session.sessionId);
+            replyText = `Perfect! ${directService} service selected. 🎯\n\nBook your appointment:\n${bookingLink}\n\nQuick, secure, and easy! Reply "Done" when finished. 🔧`;
+          } else {
+            replyText = `Hi! I'm your PlumbPro assistant. 🔧\n\nNeed plumbing help? Just say:\n• "I need help"\n• "Book service" \n• Or describe your issue\n\nI'll guide you through everything!`;
+          }
+        }
+
+        // Default fallback
+        if (!replyText) {
+          replyText = `Hi there! 👋 I'm here to help with your plumbing needs.\n\nSay "Help" to book a service, or describe what you need fixed. I'll take care of the rest! 🔧`;
+        }
+
+        // Save outgoing SMS and send if API is configured
+        const outgoing = await saveOutgoing(session.phone, replyText);
+        
+        // Try to send SMS if external API is configured
+        const smsResult = await sendSMS(session.phone, replyText);
+        if (smsResult.success) {
+          outgoing.status = 'sent';
+          outgoing.messageId = smsResult.messageId;
+          await outgoing.save();
+        } else {
+          outgoing.status = 'failed';
+          await outgoing.save();
+        }
+
         await session.save();
 
-        replyText = "Thanks — we received your request. We will inform you once your booking is accepted.";
-        await saveOutgoing(session.phone, replyText);
-      } else if (includesAny(lower, ['not yet', 'not', 'haven\'t', 'no'])) {
-        replyText = `Okay — when you're done, just reply "Done" and we'll proceed.`;
-      } else {
-        // fallback helpful reminder
-        replyText = `If you've completed the form, reply "Done". If not, you can fill it here: ${BOOKING_LINK}`;
+        results.push({
+          success: true,
+          message: 'SMS received and processed by agent',
+          data: {
+            id: smsDoc._id,
+            from: smsDoc.from,
+            to: smsDoc.to,
+            message: smsDoc.message,
+            reply: replyText,
+            session: {
+              phone: session.phone,
+              sessionId: session.sessionId,
+              state: session.state,
+              service: session.service
+            },
+            outgoingSmsId: outgoing._id,
+            smsApiResult: smsResult
+          }
+        });
+
+      } catch (msgError) {
+        console.error('Error processing message:', msgError);
+        results.push({
+          success: false,
+          error: msgError.message,
+          msgData
+        });
       }
     }
 
-    // If user already submitted earlier
-    else if (session.state === 'submitted') {
-      // user asking status?
-      if (includesAny(lower, ['status', 'update', 'when', 'accepted'])) {
-        replyText = "We will inform you once your booking is accepted. Please allow our team some time to review.";
-      } else {
-        replyText = "We will inform you once your booking is accepted. If you need anything else, let us know.";
-      }
-    }
-
-    // Fallback: if none of the above matched, attempt to handle direct service mention (user jumped straight to service)
-    else {
-      const directService = detectService(cleanMsg);
-      if (directService) {
-        // treat like they selected service
-        session.state = 'link_sent';
-        session.service = directService;
-        await session.save();
-        replyText = `Great — ${directService} selected. Please fill this short booking form so we can schedule: ${BOOKING_LINK}`;
-        await saveOutgoing(session.phone, replyText);
-      } else {
-        // default reply asking if they need help
-        replyText = "Hi — do you need help with a plumbing service? If yes, reply 'I need a plumber' or 'Help' and I will guide you.";
-      }
-    }
-
-    // If replyText is still null (shouldn't happen), default
-    if (!replyText) {
-      replyText = "Sorry — I couldn't process that. Please say 'Help' to start booking.";
-    }
-
-    // Save the outgoing SMS record (we may have saved already in some branches)
-    const outgoing = await saveOutgoing(session.phone, replyText);
-
-    // Ensure session is saved
-    await session.save();
-
-    // Return combined response
     return res.status(200).json({
       success: true,
-      message: 'SMS received and processed by agent',
-      data: {
-        id: smsDoc._id,
-        from: smsDoc.from,
-        to: smsDoc.to,
-        message: smsDoc.message,
-        createdAt: smsDoc.createdAt
-      },
-      agent: {
-        reply: replyText,
-        session: {
-          phone: session.phone,
-          sessionId: session.sessionId,
-          state: session.state,
-          service: session.service
-        },
-        outgoingSmsId: outgoing ? outgoing._id : null
-      }
+      message: `Processed ${messages.length} message(s)`,
+      results,
+      totalProcessed: results.length,
+      successful: results.filter(r => r.success).length,
+      failed: results.filter(r => !r.success).length
     });
 
   } catch (err) {
@@ -493,6 +516,100 @@ router.post('/webhook', async (req, res) => {
       success: false,
       message: 'Internal server error',
       error: err.message
+    });
+  }
+});
+
+// Endpoint to handle booking completion notifications
+router.post('/booking-notification', async (req, res) => {
+  try {
+    const { bookingId, status, phone, providerName } = req.body;
+
+    if (!bookingId || !status || !phone) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: bookingId, status, phone'
+      });
+    }
+
+    let message = '';
+    const loginLink = `${BOOKING_LINK}/login`;
+
+    switch (status) {
+      case 'accepted':
+        message = `🎉 Great news! Your plumbing service has been accepted by ${providerName || 'our certified plumber'}!\n\n✅ Booking confirmed\n📱 Track progress: ${loginLink}\n💬 Get updates here\n\nThank you for choosing PlumbPro! 🔧`;
+        break;
+      case 'quotation_sent':
+        message = `📋 Your service quotation is ready!\n\n💰 Review pricing and details\n✅ Accept/reject online: ${loginLink}\n📱 Or reply here for assistance\n\nTransparent pricing, no surprises! 🔧`;
+        break;
+      case 'completed':
+        message = `✅ Service completed successfully!\n\n🔧 Work finished by ${providerName || 'your plumber'}\n📋 Invoice available: ${loginLink}\n⭐ Please rate your experience\n\nThank you for choosing PlumbPro!`;
+        break;
+      default:
+        message = `📱 Update on your plumbing service:\n\nStatus: ${status.replace('_', ' ')}\n🔍 Full details: ${loginLink}\n\nQuestions? Just reply here! 🔧`;
+    }
+
+    // Save and send notification SMS
+    const outgoing = await saveOutgoing(phone, message);
+    const smsResult = await sendSMS(phone, message);
+    
+    if (smsResult.success) {
+      outgoing.status = 'sent';
+      outgoing.messageId = smsResult.messageId;
+    } else {
+      outgoing.status = 'failed';
+    }
+    await outgoing.save();
+
+    res.json({
+      success: true,
+      message: 'Notification sent',
+      smsId: outgoing._id,
+      smsApiResult: smsResult
+    });
+
+  } catch (error) {
+    console.error('Booking notification error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Test endpoint
+router.post('/test', async (req, res) => {
+  try {
+    const testMessage = req.body.message || 'Hello';
+    const testPhone = req.body.phone || '1234567890';
+
+    // Simulate the webhook format
+    const simulatedWebhook = [{
+      ID: Date.now(),
+      number: testPhone,
+      message: testMessage,
+      deviceID: 3,
+      simSlot: 0,
+      status: "Received",
+      sentDate: new Date().toISOString(),
+      deliveredDate: new Date().toISOString()
+    }];
+
+    // Call our own webhook
+    const result = await axios.post(`${req.protocol}://${req.get('host')}/api/sms/webhook`, simulatedWebhook);
+    
+    res.json({
+      success: true,
+      message: 'Test completed',
+      input: { message: testMessage, phone: testPhone },
+      webhookResult: result.data
+    });
+
+  } catch (error) {
+    console.error('Test error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });

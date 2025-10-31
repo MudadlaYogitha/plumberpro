@@ -1,10 +1,58 @@
 const express = require('express');
 const Booking = require('../models/Booking');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
+const axios = require('axios');
 const auth = require('../middleware/auth');
 const moment = require('moment');
 
 const router = express.Router();
+
+// Helper function to send booking notification
+const sendBookingNotification = async (booking, status, userId = null) => {
+  try {
+    // Populate booking data if needed
+    const populatedBooking = await Booking.findById(booking._id)
+      .populate('customer', 'name phone email')
+      .populate('provider', 'name phone email');
+
+    if (!populatedBooking) return;
+
+    const phone = populatedBooking.customer?.phone || populatedBooking.customerPhone;
+    const providerName = populatedBooking.provider?.name || 'our certified plumber';
+    
+    if (!phone) return;
+
+    // Send notification via webhook
+    const notificationData = {
+      bookingId: populatedBooking._id,
+      status,
+      phone,
+      providerName
+    };
+
+    try {
+      await axios.post(`${process.env.BACKEND_URL || 'http://localhost:5000'}/api/sms/booking-notification`, notificationData);
+    } catch (webhookError) {
+      console.error('Failed to send booking notification:', webhookError.message);
+    }
+
+    // Create notification record
+    const notification = new Notification({
+      bookingId: populatedBooking._id,
+      userId: userId || populatedBooking.customer,
+      type: `booking_${status}`,
+      title: `Booking ${status.replace('_', ' ')}`,
+      message: `Your ${populatedBooking.serviceType} service is now ${status.replace('_', ' ')}.`,
+      phone,
+      status: 'sent'
+    });
+    await notification.save();
+
+  } catch (error) {
+    console.error('Error sending booking notification:', error);
+  }
+};
 
 // Create booking
 router.post('/', auth, async (req, res) => {
@@ -45,6 +93,81 @@ router.post('/', auth, async (req, res) => {
     res.status(201).json({
       message: 'Booking created successfully',
       booking
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Create booking from SMS (no auth required)
+router.post('/sms-booking', async (req, res) => {
+  try {
+    const { 
+      phone, 
+      sessionId,
+      customerName, 
+      customerEmail, 
+      customerPhone, 
+      address, 
+      serviceType, 
+      description, 
+      date, 
+      timeSlot,
+      files 
+    } = req.body;
+
+    if (!phone || !sessionId) {
+      return res.status(400).json({ message: 'Phone and session ID are required' });
+    }
+
+    // Find or create user
+    let user = await User.findOne({ phone: customerPhone || phone });
+    if (!user) {
+      user = new User({
+        name: customerName || 'SMS User',
+        email: customerEmail || `sms_${Date.now()}@plumbpro.com`,
+        phone: customerPhone || phone,
+        password: 'temp123', // They can set a proper password later
+        role: 'customer',
+        address: address
+      });
+      await user.save();
+    }
+
+    const booking = new Booking({
+      customer: user._id,
+      customerName: customerName || user.name,
+      customerEmail: customerEmail || user.email,
+      customerPhone: customerPhone || phone,
+      address,
+      serviceType,
+      description,
+      date: new Date(date),
+      timeSlot,
+      files: files || [],
+      timeline: [{
+        status: 'pending',
+        timestamp: new Date(),
+        note: 'Booking created via SMS',
+        updatedBy: user._id
+      }],
+      notes: `Created via SMS session: ${sessionId}`
+    });
+
+    await booking.save();
+
+    res.status(201).json({
+      message: 'Booking created successfully',
+      booking,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email
+      },
+      loginInfo: {
+        message: 'You can login to track your booking at: ' + (process.env.FRONTEND_URL || 'http://localhost:5173') + '/login',
+        credentials: 'Use your phone number as username'
+      }
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -109,6 +232,9 @@ router.put('/:id/accept', auth, async (req, res) => {
     
     await booking.save();
 
+    // Send notification to customer
+    await sendBookingNotification(booking, 'accepted', booking.customer);
+
     const populatedBooking = await Booking.findById(booking._id)
       .populate('customer', 'name email phone')
       .populate('provider', 'name email phone')
@@ -145,6 +271,9 @@ router.put('/:id/quotation', auth, async (req, res) => {
     booking.status = 'quotation_sent';
     
     await booking.save();
+
+    // Send notification to customer
+    await sendBookingNotification(booking, 'quotation_sent', booking.customer);
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate('customer', 'name email phone')
@@ -186,6 +315,9 @@ router.put('/:id/accept-quotation', auth, async (req, res) => {
     booking.status = 'payment_completed';
     
     await booking.save();
+
+    // Send notification to customer
+    await sendBookingNotification(booking, 'payment_completed', booking.customer);
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate('customer', 'name email phone')
@@ -234,6 +366,9 @@ router.put('/:id/complete', auth, async (req, res) => {
     };
     
     await booking.save();
+
+    // Send notification to customer
+    await sendBookingNotification(booking, 'completed', booking.customer);
 
     const populatedBooking = await Booking.findById(booking._id)
       .populate('customer', 'name email phone')
