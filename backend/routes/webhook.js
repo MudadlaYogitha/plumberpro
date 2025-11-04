@@ -1,3 +1,4 @@
+// routes/sms.js
 const express = require('express');
 const axios = require('axios');
 const SMS = require('../models/SMS');
@@ -14,7 +15,7 @@ const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER || 'System';
 // Canonical service list (use lowercase when matching)
 const SERVICES = [
   'plumbing',
-  'drain cleaning', 
+  'drain cleaning',
   'water heater',
   'geyser',
   'pipe repair',
@@ -25,22 +26,19 @@ const SERVICES = [
   'other'
 ];
 
-// Helper: normalize incoming text
 function cleanText(text) {
   if (!text || typeof text !== 'string') return '';
   return text.trim();
 }
 
-// Helper: do simple intent checks
 function includesAny(text, words) {
   const t = (text || '').toLowerCase();
   return words.some(w => t.includes(w));
 }
 
-// Canonicalize service name from user text
 function detectService(text) {
   const t = (text || '').toLowerCase();
-  
+
   if (t.includes('plumb')) return 'Plumbing';
   if (t.includes('drain')) return 'Drain cleaning';
   if (t.includes('geyser') || t.includes('water heater')) return 'Water heater';
@@ -48,7 +46,7 @@ function detectService(text) {
   if (t.includes('bath') || t.includes('bathroom') || t.includes('fitting')) return 'Bathroom fitting / installation';
   if (t.includes('electr') || t.includes('socket') || t.includes('switch')) return 'Electrical (minor)';
   if (t.includes('other')) return 'Other';
-  
+
   for (const s of SERVICES) {
     if (t.includes(s)) return capitalizeService(s);
   }
@@ -68,7 +66,6 @@ function capitalizeService(s) {
   return s[0].toUpperCase() + s.slice(1);
 }
 
-// Create or update session for phone
 async function getOrCreateSession(phone) {
   const sessionId = new ObjectId().toString();
   let session = await Session.findOne({ phone });
@@ -84,7 +81,6 @@ async function getOrCreateSession(phone) {
   return session;
 }
 
-// Save outgoing SMS helper
 async function saveOutgoing(phone, text) {
   const out = new SMS({
     from: SENDER_NUMBER,
@@ -98,7 +94,6 @@ async function saveOutgoing(phone, text) {
   return out;
 }
 
-// Extract digits from text and return normalized phone string
 function extractPhoneDigits(text) {
   if (!text || typeof text !== 'string') return null;
   const digits = (text.match(/\d+/g) || []).join('');
@@ -106,12 +101,10 @@ function extractPhoneDigits(text) {
   return null;
 }
 
-// Create a guest id for anonymous chats
 function makeGuestId() {
   return `guest_${new ObjectId().toString().slice(-8)}`;
 }
 
-// Move all SMS documents from oldFrom -> newFrom
 async function reassignSmsFrom(oldFrom, newFrom) {
   try {
     const res = await SMS.updateMany({ from: oldFrom }, { $set: { from: newFrom } });
@@ -122,54 +115,73 @@ async function reassignSmsFrom(oldFrom, newFrom) {
   }
 }
 
-// Generate unique booking link with phone number
 function generateBookingLink(phone, sessionId) {
   const encodedPhone = encodeURIComponent(phone);
   const encodedSession = encodeURIComponent(sessionId);
   return `${BOOKING_LINK}/book-service?phone=${encodedPhone}&session=${encodedSession}&ref=sms`;
 }
 
-// Send SMS via external API (if configured)
-async function sendSMS(to, message) {
-  if (!process.env.SENSOR_API_KEY || !process.env.SENSOR_API_BASE_URL) {
-    console.warn('SMS API not configured, skipping actual SMS send');
-    return { success: true, messageId: `mock_${Date.now()}` };
-  }
+/**
+ * sendSMS(to, message, devices)
+ * This version *directly constructs the full URL* in the exact format you provided:
+ * https://connect.sensorequation.com/services/send-message.php?key=KEY&number=...&message=...&devices=...&type=sms&prioritize=1
+ *
+ * NOTE: it's strongly recommended to keep the API key in env vars. By default this uses
+ * process.env.SENSOR_API_KEY and process.env.SENSOR_API_BASE_URL. If you don't set them,
+ * the function will fall back to the literal key from your provided link below.
+ */
+async function sendSMS(to, message, devices = '3') {
+  // preferred: read from env
+  const SENSOR_API_BASE_URL = process.env.SENSOR_API_BASE_URL || 'https://connect.sensorequation.com';
+  // fallback to the key you gave (you can replace it with process.env.SENSOR_API_KEY in production)
+  const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '2ec54b331580a35ce223e7aaec1872b0afe27465';
+
+  // sanitize phone and message
+  const cleanTo = String(to || '').replace(/\D/g, '');
+  const devicesParam = devices ? String(devices) : '3';
+  const encodedMessage = encodeURIComponent(String(message || ''));
+
+  // build full URL exactly like your example
+  const fullUrl = `${SENSOR_API_BASE_URL.replace(/\/+$/, '')}/services/send-message.php` +
+    `?key=${encodeURIComponent(SENSOR_API_KEY)}` +
+    `&number=${encodeURIComponent(cleanTo)}` +
+    `&message=${encodedMessage}` +
+    `&devices=${encodeURIComponent(devicesParam)}` +
+    `&type=sms&prioritize=1`;
 
   try {
-    const apiUrl = `${process.env.SENSOR_API_BASE_URL}/services/send-message.php`;
-    const params = {
-      key: process.env.SENSOR_API_KEY,
-      number: to,
-      message: message,
-      devices: '2',
-      type: 'sms',
-      prioritize: '1'
-    };
+    // your sample link is query-string based; using GET makes the same request
+    const resp = await axios.get(fullUrl, { timeout: 15000 });
 
-    const response = await axios.post(apiUrl, null, { params });
+    console.log('sendSMS fullUrl:', fullUrl);
+    console.log('Gateway response status:', resp.status);
+    console.log('Gateway response data:', resp.data);
+
+    const data = resp.data || {};
     return {
-      success: response.data.success || true,
-      messageId: response.data.messageId || `sent_${Date.now()}`
+      success: typeof data.success !== 'undefined' ? data.success : true,
+      messageId: data.messageId || data.id || `sent_${Date.now()}`,
+      raw: data
     };
-  } catch (error) {
-    console.error('SMS send error:', error.message);
-    return { success: false, error: error.message };
+  } catch (err) {
+    console.error('SMS send error:', err.message || err.toString());
+    if (err.response) {
+      console.error('Gateway status:', err.response.status, 'data:', err.response.data);
+    }
+    return { success: false, error: err.message || 'Unknown error' };
   }
 }
 
-// Main webhook endpoint - handles the new schema format
+// --- webhook endpoint (keeps your existing logic, only uses sendSMS above) ---
 router.post('/webhook', async (req, res) => {
   try {
     console.log('Webhook received:', JSON.stringify(req.body, null, 2));
 
     let messages = [];
-    
-    // Handle both array and single message formats
+
     if (Array.isArray(req.body)) {
       messages = req.body;
-    } else if (req.body.message && req.body.number) {
-      // Handle direct format {message, phone}
+    } else if (req.body.message && (req.body.number || req.body.phone)) {
       messages = [{
         message: req.body.message,
         number: req.body.phone || req.body.number
@@ -185,37 +197,27 @@ router.post('/webhook', async (req, res) => {
 
     for (const msgData of messages) {
       try {
-        // Extract message and phone from the new schema format
         const message = msgData.message;
         const phone = msgData.number;
 
         if (!message) {
-          results.push({
-            success: false,
-            error: 'Message field is required',
-            msgData
-          });
+          results.push({ success: false, error: 'Message field is required', msgData });
           continue;
         }
 
         const cleanMsg = cleanText(message);
         const lower = cleanMsg.toLowerCase();
-        
-        // Normalize phone number or create guest ID
+
         let normalizedPhone = phone;
-        let isGuest = false;
-        
         if (!phone || String(phone).trim().toLowerCase() === 'unknown' || String(phone).trim() === '') {
-          isGuest = true;
           normalizedPhone = makeGuestId();
         } else {
-          normalizedPhone = String(phone).replace(/\D/g, ''); // Remove non-digits
+          normalizedPhone = String(phone).replace(/\D/g, '');
         }
 
         const from = normalizedPhone;
         const to = process.env.SMS_SYSTEM_NUMBER || 'system';
 
-        // Save incoming SMS
         const smsDoc = new SMS({
           from,
           to,
@@ -228,64 +230,51 @@ router.post('/webhook', async (req, res) => {
         });
         await smsDoc.save();
 
-        // Get or create session
         let session = await getOrCreateSession(from);
         let replyText = null;
 
-        // PART A: Guest session - ask for phone
         if (session.phone && session.phone.startsWith('guest_') && session.state !== 'awaiting_phone') {
           session.state = 'awaiting_phone';
           await session.save();
 
           replyText = "Hi! I'm your PlumbPro assistant. To help you book a service, please reply with your phone number (e.g., 9123456789) so I can create a personalized booking link for you.";
-          
+
           const outgoing = await saveOutgoing(session.phone, replyText);
-          
+          const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
+          if (smsResult.success) {
+            outgoing.status = 'sent';
+            outgoing.messageId = smsResult.messageId;
+          } else {
+            outgoing.status = 'failed';
+          }
+          await outgoing.save();
+
           results.push({
             success: true,
             message: 'SMS received and processed (awaiting phone)',
-            data: {
-              id: smsDoc._id,
-              from: smsDoc.from,
-              to: smsDoc.to,
-              message: smsDoc.message,
-              reply: replyText
-            }
+            data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult }
           });
           continue;
         }
 
-        // PART B: Awaiting phone - process phone number
+        // awaiting phone flow
         if (session.state === 'awaiting_phone') {
           const possiblePhone = extractPhoneDigits(cleanMsg);
           if (possiblePhone) {
             const normalizedNewPhone = possiblePhone;
-
-            // Check if session exists for this real phone
             let existing = await Session.findOne({ phone: normalizedNewPhone });
 
             if (existing) {
-              // Merge guest -> existing session
               try {
                 const reassignRes = await reassignSmsFrom(session.phone, normalizedNewPhone);
-                if (reassignRes) {
-                  console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${session.phone} -> ${normalizedNewPhone}`);
-                }
-              } catch (e) {
-                console.warn('Failed to reassign SMS docs to existing session phone', e);
-              }
+                if (reassignRes) console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${session.phone} -> ${normalizedNewPhone}`);
+              } catch (e) { console.warn('reassignSmsFrom failed', e); }
 
-              try {
-                await Session.deleteOne({ _id: session._id });
-              } catch (e) {
-                console.warn('Failed to delete guest session after merge', e);
-              }
+              try { await Session.deleteOne({ _id: session._id }); } catch (e) { console.warn('Failed to delete guest session', e); }
 
               session = existing;
               replyText = `Great! I've linked this chat to your phone ${normalizedNewPhone}. How can I help you today? Just say "I need help" or "book service" to get started.`;
-
             } else {
-              // Update guest session to real phone session
               const oldGuest = session.phone;
               session.phone = normalizedNewPhone;
               session.state = 'new';
@@ -293,91 +282,53 @@ router.post('/webhook', async (req, res) => {
 
               try {
                 const reassignRes = await reassignSmsFrom(oldGuest, normalizedNewPhone);
-                if (reassignRes) {
-                  console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${oldGuest} -> ${normalizedNewPhone}`);
-                }
-              } catch (e) {
-                console.warn('Failed to reassign SMS docs from guest to new phone', e);
-              }
+                if (reassignRes) console.log(`Reassigned ${reassignRes.modifiedCount} SMS docs from ${oldGuest} -> ${normalizedNewPhone}`);
+              } catch (e) { console.warn('reassignSmsFrom failed', e); }
 
-              try {
-                smsDoc.from = normalizedNewPhone;
-                await smsDoc.save();
-              } catch (e) {
-                console.warn('Failed to update smsDoc.from to normalized phone', e);
-              }
+              try { smsDoc.from = normalizedNewPhone; await smsDoc.save(); } catch (e) { console.warn('Failed update smsDoc.from', e); }
 
               replyText = `Perfect! Your phone number ${normalizedNewPhone} is saved. Which service do you need? For example: Plumbing, Drain cleaning, Water heater, Pipe repair, Bathroom fitting, Electrical, or Other.`;
             }
 
             const out = await saveOutgoing(session.phone, replyText);
-            
-            results.push({
-              success: true,
-              message: 'Phone received and processed',
-              data: {
-                id: smsDoc._id,
-                from: smsDoc.from,
-                to: smsDoc.to,
-                message: smsDoc.message,
-                reply: replyText
-              }
-            });
-            continue;
+            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
+            if (smsResult.success) { out.status = 'sent'; out.messageId = smsResult.messageId; } else { out.status = 'failed'; }
+            await out.save();
 
+            results.push({ success: true, message: 'Phone received and processed', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
+            continue;
           } else {
             replyText = "Please enter a valid phone number (digits only, e.g., 9123456789) so I can create your booking link.";
-            await saveOutgoing(session.phone, replyText);
-            
-            results.push({
-              success: true,
-              message: 'Awaiting valid phone number',
-              data: {
-                id: smsDoc._id,
-                from: smsDoc.from,
-                to: smsDoc.to,
-                message: smsDoc.message,
-                reply: replyText
-              }
-            });
+            const out = await saveOutgoing(session.phone, replyText);
+            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
+            if (smsResult.success) { out.status = 'sent'; out.messageId = smsResult.messageId; } else { out.status = 'failed'; }
+            await out.save();
+
+            results.push({ success: true, message: 'Awaiting valid phone number', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
             continue;
           }
         }
 
-        // PART C: Normal flow for sessions with real phone numbers
-        
-        // Emergency handling
+        // main dialog flow (kept same as your logic)
         if (includesAny(lower, ['emergency', 'urgent', 'help now', 'immediately'])) {
           replyText = "🚨 If this is an emergency, please call our 24/7 emergency line: (555) PLUMBER. For non-urgent requests, I can help you book a service right away!";
           session.state = 'new';
           await session.save();
-        }
-
-        // Cancel/stop
-        else if (lower === 'cancel' || lower === 'stop') {
+        } else if (lower === 'cancel' || lower === 'stop') {
           session.state = 'cancelled';
           await session.save();
           replyText = "Your request has been cancelled. If you need plumbing services in the future, just text me anytime. Have a great day! 👋";
-        }
-
-        // Pricing inquiry
-        else if (includesAny(lower, ['price', 'pricing', 'cost', 'how much', 'rate', 'charge'])) {
+        } else if (includesAny(lower, ['price', 'pricing', 'cost', 'how much', 'rate', 'charge'])) {
           const bookingLink = generateBookingLink(session.phone, session.sessionId);
           replyText = `Our pricing varies by service type and complexity. To get an accurate quote, please use your personalized booking form: ${bookingLink}\n\nOur certified plumbers will provide a detailed quote before starting any work. No surprises! 💰`;
           session.state = 'link_sent';
           await session.save();
-        }
-
-        // Main help/booking request
-        else if ((session.state === 'new' || !session.state) && includesAny(lower, ['help', 'need', 'book', 'plumber', 'plumbing', 'i need', 'i want', 'service', 'repair', 'fix'])) {
+        } else if ((session.state === 'new' || !session.state) && includesAny(lower, ['help', 'need', 'book', 'plumber', 'plumbing', 'i need', 'i want', 'service', 'repair', 'fix'])) {
           replyText = `I'm here to help! 🔧 Which plumbing service do you need?\n\n• Plumbing (leaks, clogs, taps)\n• Drain cleaning\n• Water heater / geyser\n• Pipe repair / replacement\n• Bathroom fitting / installation\n• Electrical (minor)\n• Other\n\nJust reply with the service type you need!`;
           session.state = 'awaiting_service';
           session.service = null;
           await session.save();
-        }
-
-        // Waiting for service selection
-        else if (session.state === 'awaiting_service') {
+        } else if (session.state === 'awaiting_service') {
           const detected = detectService(cleanMsg);
           if (detected) {
             if (detected.toLowerCase().includes('other')) {
@@ -395,20 +346,14 @@ router.post('/webhook', async (req, res) => {
           } else {
             replyText = "I didn't quite catch that. Please choose from:\n\n• Plumbing\n• Drain cleaning\n• Water heater\n• Pipe repair\n• Bathroom fitting\n• Electrical\n• Other\n\nJust type the service you need! 🔧";
           }
-        }
-
-        // Handle "other" description
-        else if (session.state === 'awaiting_other_desc') {
+        } else if (session.state === 'awaiting_other_desc') {
           session.service = `Other: ${cleanMsg}`;
           session.state = 'link_sent';
           await session.save();
 
           const bookingLink = generateBookingLink(session.phone, session.sessionId);
           replyText = `Got it! I've noted your request: "${cleanMsg}" 📝\n\nComplete your booking here:\n${bookingLink}\n\nOur expert plumbers will review your specific needs and provide the best solution!`;
-        }
-
-        // Link sent - waiting for form completion
-        else if (session.state === 'link_sent') {
+        } else if (session.state === 'link_sent') {
           if (includesAny(lower, ['done', 'submitted', 'completed', 'filled', 'finished', 'sent'])) {
             session.state = 'submitted';
             await session.save();
@@ -424,25 +369,19 @@ router.post('/webhook', async (req, res) => {
             const bookingLink = generateBookingLink(session.phone, session.sessionId);
             replyText = `Please complete your booking form: ${bookingLink}\n\n💡 After filling it out, reply "Done" and I'll confirm everything is set! Need the link again? Just ask!`;
           }
-        }
-
-        // Already submitted - status inquiries
-        else if (session.state === 'submitted') {
+        } else if (session.state === 'submitted') {
           if (includesAny(lower, ['status', 'update', 'when', 'accepted', 'progress', 'news'])) {
             replyText = `⏳ Your booking is being reviewed by our team. You'll get a notification once a plumber accepts your request!\n\n📱 Track live updates: ${BOOKING_LINK}/login\n\nUsually takes 30-60 minutes during business hours.`;
           } else {
             replyText = `Your booking request is submitted! 🎯\n\n📱 Track status: ${BOOKING_LINK}/login\n💬 Get updates here automatically\n🔧 Our plumbers are reviewing your request\n\nNeed help with something else?`;
           }
-        }
-
-        // Fallback - try to detect direct service mention
-        else {
+        } else {
           const directService = detectService(cleanMsg);
           if (directService) {
             session.state = 'link_sent';
             session.service = directService;
             await session.save();
-            
+
             const bookingLink = generateBookingLink(session.phone, session.sessionId);
             replyText = `Perfect! ${directService} service selected. 🎯\n\nBook your appointment:\n${bookingLink}\n\nQuick, secure, and easy! Reply "Done" when finished. 🔧`;
           } else {
@@ -450,24 +389,19 @@ router.post('/webhook', async (req, res) => {
           }
         }
 
-        // Default fallback
         if (!replyText) {
           replyText = `Hi there! 👋 I'm here to help with your plumbing needs.\n\nSay "Help" to book a service, or describe what you need fixed. I'll take care of the rest! 🔧`;
         }
 
-        // Save outgoing SMS and send if API is configured
         const outgoing = await saveOutgoing(session.phone, replyText);
-        
-        // Try to send SMS if external API is configured
-        const smsResult = await sendSMS(session.phone, replyText);
+        const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
         if (smsResult.success) {
           outgoing.status = 'sent';
           outgoing.messageId = smsResult.messageId;
-          await outgoing.save();
         } else {
           outgoing.status = 'failed';
-          await outgoing.save();
         }
+        await outgoing.save();
 
         await session.save();
 
@@ -480,12 +414,7 @@ router.post('/webhook', async (req, res) => {
             to: smsDoc.to,
             message: smsDoc.message,
             reply: replyText,
-            session: {
-              phone: session.phone,
-              sessionId: session.sessionId,
-              state: session.state,
-              service: session.service
-            },
+            session: { phone: session.phone, sessionId: session.sessionId, state: session.state, service: session.service },
             outgoingSmsId: outgoing._id,
             smsApiResult: smsResult
           }
@@ -493,11 +422,7 @@ router.post('/webhook', async (req, res) => {
 
       } catch (msgError) {
         console.error('Error processing message:', msgError);
-        results.push({
-          success: false,
-          error: msgError.message,
-          msgData
-        });
+        results.push({ success: false, error: msgError.message, msgData });
       }
     }
 
@@ -512,29 +437,18 @@ router.post('/webhook', async (req, res) => {
 
   } catch (err) {
     console.error('Webhook internal error:', err);
-    return res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: err.message
-    });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: err.message });
   }
 });
 
-// Endpoint to handle booking completion notifications
+// booking-notification, test endpoints retained unchanged...
 router.post('/booking-notification', async (req, res) => {
   try {
     const { bookingId, status, phone, providerName } = req.body;
-
-    if (!bookingId || !status || !phone) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: bookingId, status, phone'
-      });
-    }
+    if (!bookingId || !status || !phone) return res.status(400).json({ success: false, error: 'Missing required fields: bookingId, status, phone' });
 
     let message = '';
     const loginLink = `${BOOKING_LINK}/login`;
-
     switch (status) {
       case 'accepted':
         message = `🎉 Great news! Your plumbing service has been accepted by ${providerName || 'our certified plumber'}!\n\n✅ Booking confirmed\n📱 Track progress: ${loginLink}\n💬 Get updates here\n\nThank you for choosing PlumbPro! 🔧`;
@@ -549,41 +463,24 @@ router.post('/booking-notification', async (req, res) => {
         message = `📱 Update on your plumbing service:\n\nStatus: ${status.replace('_', ' ')}\n🔍 Full details: ${loginLink}\n\nQuestions? Just reply here! 🔧`;
     }
 
-    // Save and send notification SMS
     const outgoing = await saveOutgoing(phone, message);
-    const smsResult = await sendSMS(phone, message);
-    
-    if (smsResult.success) {
-      outgoing.status = 'sent';
-      outgoing.messageId = smsResult.messageId;
-    } else {
-      outgoing.status = 'failed';
-    }
+    const smsResult = await sendSMS(phone, message, undefined);
+    if (smsResult.success) { outgoing.status = 'sent'; outgoing.messageId = smsResult.messageId; } else { outgoing.status = 'failed'; }
     await outgoing.save();
 
-    res.json({
-      success: true,
-      message: 'Notification sent',
-      smsId: outgoing._id,
-      smsApiResult: smsResult
-    });
+    res.json({ success: true, message: 'Notification sent', smsId: outgoing._id, smsApiResult: smsResult });
 
   } catch (error) {
     console.error('Booking notification error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// Test endpoint
 router.post('/test', async (req, res) => {
   try {
     const testMessage = req.body.message || 'Hello';
     const testPhone = req.body.phone || '1234567890';
 
-    // Simulate the webhook format
     const simulatedWebhook = [{
       ID: Date.now(),
       number: testPhone,
@@ -595,23 +492,15 @@ router.post('/test', async (req, res) => {
       deliveredDate: new Date().toISOString()
     }];
 
-    // Call our own webhook
     const result = await axios.post(`${req.protocol}://${req.get('host')}/api/sms/webhook`, simulatedWebhook);
-    
-    res.json({
-      success: true,
-      message: 'Test completed',
-      input: { message: testMessage, phone: testPhone },
-      webhookResult: result.data
-    });
+
+    res.json({ success: true, message: 'Test completed', input: { message: testMessage, phone: testPhone }, webhookResult: result.data });
 
   } catch (error) {
     console.error('Test error:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
 module.exports = router;
+
