@@ -2,10 +2,10 @@
   "name": "plumbing-backend",
   "version": "1.0.0",
   "description": "Plumbing booking system backend",
-  "main": "server.js",
+  "main": "api/server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node api/server.js",
+    "dev": "nodemon api/server.js"
   },
   "dependencies": {
     "axios": "^1.12.2",
