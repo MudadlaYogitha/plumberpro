@@ -11,8 +11,19 @@ const router = express.Router();
 
 const BOOKING_LINK = process.env.FRONTEND_URL || 'http://localhost:5173';
 const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER || 'System';
+const SENSOR_API_BASE_URL = (process.env.SENSOR_API_BASE_URL || 'https://connect.sensorequation.com').replace(/\/+$/, '');
+const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '2ec54b331580a35ce223e7aaec1872b0afe27465';
+const SENSOR_API_DEFAULT_DEVICES = process.env.SENSOR_API_DEFAULT_DEVICES || '3';
+const SENDSMS_MAX_RETRIES = 3;
+const SENDSMS_BASE_DELAY_MS = 800; // backoff multiplier
 
-// Canonical service list (use lowercase when matching)
+// Allow preflight on webhook
+router.options('/webhook', (req, res) => {
+  res.setHeader('Allow', 'OPTIONS,POST');
+  return res.sendStatus(200);
+});
+
+// Canonical service list
 const SERVICES = [
   'plumbing',
   'drain cleaning',
@@ -121,58 +132,104 @@ function generateBookingLink(phone, sessionId) {
   return `${BOOKING_LINK}/book-service?phone=${encodedPhone}&session=${encodedSession}&ref=sms`;
 }
 
-/**
- * sendSMS(to, message, devices)
- * This version *directly constructs the full URL* in the exact format you provided:
- * https://connect.sensorequation.com/services/send-message.php?key=KEY&number=...&message=...&devices=...&type=sms&prioritize=1
- *
- * NOTE: it's strongly recommended to keep the API key in env vars. By default this uses
- * process.env.SENSOR_API_KEY and process.env.SENSOR_API_BASE_URL. If you don't set them,
- * the function will fall back to the literal key from your provided link below.
- */
-async function sendSMS(to, message, devices = '3') {
-  // preferred: read from env
-  const SENSOR_API_BASE_URL = process.env.SENSOR_API_BASE_URL || 'https://connect.sensorequation.com';
-  // fallback to the key you gave (you can replace it with process.env.SENSOR_API_KEY in production)
-  const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '2ec54b331580a35ce223e7aaec1872b0afe27465';
-
-  // sanitize phone and message
-  const cleanTo = String(to || '').replace(/\D/g, '');
-  const devicesParam = devices ? String(devices) : '3';
-  const encodedMessage = encodeURIComponent(String(message || ''));
-
-  // build full URL exactly like your example
-  const fullUrl = `${SENSOR_API_BASE_URL.replace(/\/+$/, '')}/services/send-message.php` +
-    `?key=${encodeURIComponent(SENSOR_API_KEY)}` +
-    `&number=${encodeURIComponent(cleanTo)}` +
-    `&message=${encodedMessage}` +
-    `&devices=${encodeURIComponent(devicesParam)}` +
-    `&type=sms&prioritize=1`;
-
-  try {
-    // your sample link is query-string based; using GET makes the same request
-    const resp = await axios.get(fullUrl, { timeout: 15000 });
-
-    console.log('sendSMS fullUrl:', fullUrl);
-    console.log('Gateway response status:', resp.status);
-    console.log('Gateway response data:', resp.data);
-
-    const data = resp.data || {};
-    return {
-      success: typeof data.success !== 'undefined' ? data.success : true,
-      messageId: data.messageId || data.id || `sent_${Date.now()}`,
-      raw: data
-    };
-  } catch (err) {
-    console.error('SMS send error:', err.message || err.toString());
-    if (err.response) {
-      console.error('Gateway status:', err.response.status, 'data:', err.response.data);
-    }
-    return { success: false, error: err.message || 'Unknown error' };
-  }
+// small sleep helper
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// --- webhook endpoint (keeps your existing logic, only uses sendSMS above) ---
+/**
+ * sendSMS
+ * - Tries GET first (query-string) to match the sample
+ * - Retries up to SENDSMS_MAX_RETRIES with exponential backoff
+ * - If GET fails (network/error or gateway returns failure), tries POST form-encoded once per attempt
+ * - Returns { success, messageId, raw, error, attemptCount, method }
+ */
+async function sendSMS(to, message, devices = null) {
+  const cleanTo = String(to || '').replace(/\D/g, '');
+  const devicesParam = devices ? String(devices) : SENSOR_API_DEFAULT_DEVICES;
+  const safeMessage = String(message || '');
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= SENDSMS_MAX_RETRIES; ++attempt) {
+    const delayMs = SENDSMS_BASE_DELAY_MS * (attempt - 1);
+    if (delayMs > 0) await sleep(delayMs);
+
+    // Build GET URL
+    const url = `${SENSOR_API_BASE_URL}/services/send-message.php` +
+      `?key=${encodeURIComponent(SENSOR_API_KEY)}` +
+      `&number=${encodeURIComponent(cleanTo)}` +
+      `&message=${encodeURIComponent(safeMessage)}` +
+      `&devices=${encodeURIComponent(devicesParam)}` +
+      `&type=sms&prioritize=1`;
+
+    try {
+      console.log(`[sendSMS] attempt=${attempt} method=GET url=${url}`);
+      const resp = await axios.get(url, { timeout: 15000 });
+      console.log('[sendSMS] GET response status:', resp.status);
+      console.log('[sendSMS] GET response data:', JSON.stringify(resp.data).slice(0, 2000)); // limit log size
+
+      const data = resp.data || {};
+      const successFlag = (typeof data.success !== 'undefined') ? data.success : true;
+      const messageId = data.messageId || data.id || (data.data && data.data.messages && data.data.messages[0] && data.data.messages[0].ID) || `sent_${Date.now()}`;
+
+      if (successFlag) {
+        return { success: true, messageId, raw: data, attemptCount: attempt, method: 'GET' };
+      } else {
+        // gateway returned an unsuccessful response — log and try POST fallback in this attempt
+        lastError = { attempt, method: 'GET', data };
+        console.warn('[sendSMS] GET gateway returned success:false, falling back to POST this attempt', data);
+      }
+
+    } catch (err) {
+      lastError = { attempt, method: 'GET', error: err.message, response: err.response && err.response.data };
+      console.error('[sendSMS] GET error:', err.message);
+      if (err.response) console.error('[sendSMS] GET error response data:', JSON.stringify(err.response.data).slice(0,2000));
+    }
+
+    // Fallback: try POST form-encoded for the same attempt
+    try {
+      const postUrl = `${SENSOR_API_BASE_URL}/services/send-message.php`;
+      const params = new URLSearchParams();
+      params.append('key', SENSOR_API_KEY);
+      params.append('number', cleanTo);
+      params.append('message', safeMessage);
+      params.append('devices', devicesParam);
+      params.append('type', 'sms');
+      params.append('prioritize', '1');
+
+      console.log(`[sendSMS] attempt=${attempt} method=POST url=${postUrl} body=${params.toString().slice(0,1000)}`);
+      const respPost = await axios.post(postUrl, params.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15000
+      });
+      console.log('[sendSMS] POST response status:', respPost.status);
+      console.log('[sendSMS] POST response data:', JSON.stringify(respPost.data).slice(0,2000));
+
+      const pdata = respPost.data || {};
+      const successFlagPost = (typeof pdata.success !== 'undefined') ? pdata.success : true;
+      const messageIdPost = pdata.messageId || pdata.id || (pdata.data && pdata.data.messages && pdata.data.messages[0] && pdata.data.messages[0].ID) || `sent_${Date.now()}`;
+
+      if (successFlagPost) {
+        return { success: true, messageId: messageIdPost, raw: pdata, attemptCount: attempt, method: 'POST' };
+      } else {
+        lastError = { attempt, method: 'POST', data: pdata };
+        console.warn('[sendSMS] POST gateway returned success:false', pdata);
+      }
+    } catch (errPost) {
+      lastError = { attempt, method: 'POST', error: errPost.message, response: errPost.response && errPost.response.data };
+      console.error('[sendSMS] POST error:', errPost.message);
+      if (errPost.response) console.error('[sendSMS] POST error response data:', JSON.stringify(errPost.response.data).slice(0,2000));
+    }
+
+    // loop to next attempt if any
+  }
+
+  // all attempts failed
+  return { success: false, error: 'All send attempts failed', lastError };
+}
+
+// --- webhook endpoint ---
 router.post('/webhook', async (req, res) => {
   try {
     console.log('Webhook received:', JSON.stringify(req.body, null, 2));
@@ -182,15 +239,9 @@ router.post('/webhook', async (req, res) => {
     if (Array.isArray(req.body)) {
       messages = req.body;
     } else if (req.body.message && (req.body.number || req.body.phone)) {
-      messages = [{
-        message: req.body.message,
-        number: req.body.phone || req.body.number
-      }];
+      messages = [{ message: req.body.message, number: req.body.phone || req.body.number }];
     } else {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid webhook payload format'
-      });
+      return res.status(400).json({ success: false, error: 'Invalid webhook payload format' });
     }
 
     const results = [];
@@ -233,6 +284,7 @@ router.post('/webhook', async (req, res) => {
         let session = await getOrCreateSession(from);
         let replyText = null;
 
+        // Guest flow (ask phone)
         if (session.phone && session.phone.startsWith('guest_') && session.state !== 'awaiting_phone') {
           session.state = 'awaiting_phone';
           await session.save();
@@ -240,24 +292,19 @@ router.post('/webhook', async (req, res) => {
           replyText = "Hi! I'm your PlumbPro assistant. To help you book a service, please reply with your phone number (e.g., 9123456789) so I can create a personalized booking link for you.";
 
           const outgoing = await saveOutgoing(session.phone, replyText);
-          const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
-          if (smsResult.success) {
-            outgoing.status = 'sent';
-            outgoing.messageId = smsResult.messageId;
-          } else {
-            outgoing.status = 'failed';
-          }
+          const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
+
+          // attach raw result to outgoing doc for debugging
+          outgoing.smsApiResult = smsResult;
+          outgoing.status = smsResult.success ? 'sent' : 'failed';
+          if (smsResult.messageId) outgoing.messageId = smsResult.messageId;
           await outgoing.save();
 
-          results.push({
-            success: true,
-            message: 'SMS received and processed (awaiting phone)',
-            data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult }
-          });
+          results.push({ success: true, message: 'SMS received and processed (awaiting phone)', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
           continue;
         }
 
-        // awaiting phone flow
+        // awaiting_phone flow
         if (session.state === 'awaiting_phone') {
           const possiblePhone = extractPhoneDigits(cleanMsg);
           if (possiblePhone) {
@@ -291,8 +338,10 @@ router.post('/webhook', async (req, res) => {
             }
 
             const out = await saveOutgoing(session.phone, replyText);
-            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
-            if (smsResult.success) { out.status = 'sent'; out.messageId = smsResult.messageId; } else { out.status = 'failed'; }
+            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
+            out.smsApiResult = smsResult;
+            out.status = smsResult.success ? 'sent' : 'failed';
+            if (smsResult.messageId) out.messageId = smsResult.messageId;
             await out.save();
 
             results.push({ success: true, message: 'Phone received and processed', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
@@ -300,8 +349,10 @@ router.post('/webhook', async (req, res) => {
           } else {
             replyText = "Please enter a valid phone number (digits only, e.g., 9123456789) so I can create your booking link.";
             const out = await saveOutgoing(session.phone, replyText);
-            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
-            if (smsResult.success) { out.status = 'sent'; out.messageId = smsResult.messageId; } else { out.status = 'failed'; }
+            const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
+            out.smsApiResult = smsResult;
+            out.status = smsResult.success ? 'sent' : 'failed';
+            if (smsResult.messageId) out.messageId = smsResult.messageId;
             await out.save();
 
             results.push({ success: true, message: 'Awaiting valid phone number', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
@@ -309,7 +360,7 @@ router.post('/webhook', async (req, res) => {
           }
         }
 
-        // main dialog flow (kept same as your logic)
+        // main dialog flow (rest of your logic unchanged)...
         if (includesAny(lower, ['emergency', 'urgent', 'help now', 'immediately'])) {
           replyText = "🚨 If this is an emergency, please call our 24/7 emergency line: (555) PLUMBER. For non-urgent requests, I can help you book a service right away!";
           session.state = 'new';
@@ -394,13 +445,10 @@ router.post('/webhook', async (req, res) => {
         }
 
         const outgoing = await saveOutgoing(session.phone, replyText);
-        const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || '3');
-        if (smsResult.success) {
-          outgoing.status = 'sent';
-          outgoing.messageId = smsResult.messageId;
-        } else {
-          outgoing.status = 'failed';
-        }
+        const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
+        outgoing.smsApiResult = smsResult;
+        outgoing.status = smsResult.success ? 'sent' : 'failed';
+        if (smsResult.messageId) outgoing.messageId = smsResult.messageId;
         await outgoing.save();
 
         await session.save();
@@ -441,6 +489,20 @@ router.post('/webhook', async (req, res) => {
   }
 });
 
+// Endpoint to call the gateway directly for testing
+router.post('/gateway-test', async (req, res) => {
+  try {
+    const { phone, message, devices } = req.body;
+    if (!phone || !message) return res.status(400).json({ success: false, error: 'Missing phone or message' });
+
+    const result = await sendSMS(phone, message, devices || SENSOR_API_DEFAULT_DEVICES);
+    return res.json({ success: true, result });
+  } catch (err) {
+    console.error('gateway-test error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // booking-notification, test endpoints retained unchanged...
 router.post('/booking-notification', async (req, res) => {
   try {
@@ -465,6 +527,7 @@ router.post('/booking-notification', async (req, res) => {
 
     const outgoing = await saveOutgoing(phone, message);
     const smsResult = await sendSMS(phone, message, undefined);
+    outgoing.smsApiResult = smsResult;
     if (smsResult.success) { outgoing.status = 'sent'; outgoing.messageId = smsResult.messageId; } else { outgoing.status = 'failed'; }
     await outgoing.save();
 
@@ -503,4 +566,3 @@ router.post('/test', async (req, res) => {
 });
 
 module.exports = router;
-
