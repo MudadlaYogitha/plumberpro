@@ -12,11 +12,11 @@ const router = express.Router();
 const BOOKING_LINK = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // numeric system/sender numbers (so DB shows actual numbers)
-const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER || process.env.SMS_SYSTEM_NUMBER || '0000000000';
-const SYSTEM_NUMBER = process.env.SMS_SYSTEM_NUMBER || SENDER_NUMBER || '0000000000';
+const SENDER_NUMBER = (process.env.SMS_SENDER_NUMBER || process.env.SMS_SYSTEM_NUMBER || '0000000000').toString().replace(/\D/g, '');
+const SYSTEM_NUMBER = (process.env.SMS_SYSTEM_NUMBER || SENDER_NUMBER || '0000000000').toString().replace(/\D/g, '');
 
 const SENSOR_API_BASE_URL = (process.env.SENSOR_API_BASE_URL || 'https://connect.sensorequation.com').replace(/\/+$/, '');
-const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '2ec54b331580a35ce223e7aaec1872b0afe27465';
+const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '';
 const SENSOR_API_DEFAULT_DEVICES = process.env.SENSOR_API_DEFAULT_DEVICES || '3';
 const SENDSMS_MAX_RETRIES = parseInt(process.env.SENDSMS_MAX_RETRIES || '3', 10);
 const SENDSMS_BASE_DELAY_MS = parseInt(process.env.SENDSMS_BASE_DELAY_MS || '800', 10);
@@ -28,7 +28,6 @@ router.options('/webhook', (req, res) => {
   return res.sendStatus(200);
 });
 
-// small helpers and dialog logic (same as before)
 const SERVICES = [
   'plumbing','drain cleaning','water heater','geyser','pipe repair',
   'pipe replacement','bathroom fitting','installation','electrical','other'
@@ -79,11 +78,11 @@ async function getOrCreateSession(phone) {
 async function saveOutgoing(phone, text, options = {}) {
   const out = new SMS({
     from: SENDER_NUMBER,
-    to: phone,
+    to: options.sendTo || phone,
     message: text,
     type: 'sent',
-    status: 'pending',
-    messageId: `auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    status: options.initialStatus || 'pending',
+    messageId: options.messageId || `auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
     replyTo: options.replyTo || null,
     webhookData: options.webhookData || undefined,
     deviceId: options.deviceId || undefined,
@@ -122,6 +121,14 @@ function generateBookingLink(phone, sessionId) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+function normalizeToDigits(v) {
+  if (!v && v !== 0) return '';
+  return String(v).replace(/\D/g, '');
+}
+function isValidPhoneDigits(digits) {
+  return !!(digits && digits.length >= 10 && digits.length <= 15);
+}
+
 /**
  * sendSMS
  * - Attempts GET then POST per attempt
@@ -129,7 +136,11 @@ function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
  * - Returns { success, messageId, raw, attempts }
  */
 async function sendSMS(to, message, devices = null) {
-  const cleanTo = String(to || '').replace(/\D/g, '');
+  const cleanTo = normalizeToDigits(to);
+  if (!isValidPhoneDigits(cleanTo)) {
+    return { success: false, error: 'Invalid destination phone number', attempts: [] };
+  }
+
   const devicesParam = devices ? String(devices) : SENSOR_API_DEFAULT_DEVICES;
   const safeMessage = String(message || '');
 
@@ -139,7 +150,6 @@ async function sendSMS(to, message, devices = null) {
     const delayMs = SENDSMS_BASE_DELAY_MS * (attempt - 1);
     if (delayMs > 0) await sleep(delayMs);
 
-    // GET attempt (gateway expects query-string in example)
     const url = `${SENSOR_API_BASE_URL}/services/send-message.php` +
       `?key=${encodeURIComponent(SENSOR_API_KEY)}` +
       `&number=${encodeURIComponent(cleanTo)}` +
@@ -213,8 +223,14 @@ async function sendSMS(to, message, devices = null) {
 // runSend: background worker to call sendSMS and update outgoing doc with full attempts
 async function runSend(outgoingId, to, message, devices) {
   try {
-    // call the gateway; this returns attempts + result
-    const result = await sendSMS(to, message, devices);
+    const cleanTo = normalizeToDigits(to);
+    if (!isValidPhoneDigits(cleanTo)) {
+      const smsApiResult = { error: 'Invalid destination phone number; not attempting gateway send', dest: to };
+      await SMS.findByIdAndUpdate(outgoingId, { $set: { smsApiResult, status: 'failed' } }, { new: true });
+      return;
+    }
+
+    const result = await sendSMS(cleanTo, message, devices);
     const update = {
       smsApiResult: result,
       status: result.success ? 'sent' : 'failed'
@@ -253,6 +269,8 @@ router.post('/webhook', async (req, res) => {
       messages = req.body;
     } else if (req.body.message && (req.body.number || req.body.phone)) {
       messages = [{ message: req.body.message, number: req.body.phone || req.body.number, ...req.body }];
+    } else if (req.body.message && req.body.sender) {
+      messages = [{ message: req.body.message, number: req.body.sender, ...req.body }];
     } else {
       return res.status(400).json({ success: false, error: 'Invalid webhook payload format' });
     }
@@ -262,7 +280,8 @@ router.post('/webhook', async (req, res) => {
     for (const msgData of messages) {
       try {
         const message = msgData.message;
-        const phone = msgData.number;
+        // provider field variations
+        const rawPhoneCandidate = msgData.number || msgData.phone || msgData.from || msgData.sender || null;
 
         if (!message) {
           results.push({ success: false, error: 'Message field is required', msgData });
@@ -272,11 +291,9 @@ router.post('/webhook', async (req, res) => {
         const cleanMsg = cleanText(message);
         const lower = cleanMsg.toLowerCase();
 
-        let normalizedPhone = phone;
-        if (!phone || String(phone).trim().toLowerCase() === 'unknown' || String(phone).trim() === '') {
+        let normalizedPhone = rawPhoneCandidate ? normalizeToDigits(rawPhoneCandidate) : null;
+        if (!normalizedPhone || normalizedPhone.length === 0) {
           normalizedPhone = makeGuestId();
-        } else {
-          normalizedPhone = String(phone).replace(/\D/g, '');
         }
 
         const from = normalizedPhone;
@@ -298,9 +315,19 @@ router.post('/webhook', async (req, res) => {
         // 2) session & dialog handling (decide replyText)
         let session = await getOrCreateSession(from);
         let replyText = null;
+        let sendTarget = null; // numeric phone we'll actually attempt to send to (if available)
+
+        // prefer raw numeric provider number for sending replies when available
+        if (rawPhoneCandidate && isValidPhoneDigits(normalizeToDigits(rawPhoneCandidate))) {
+          sendTarget = normalizeToDigits(rawPhoneCandidate);
+        } else if (session && session.phone && isValidPhoneDigits(normalizeToDigits(session.phone))) {
+          sendTarget = normalizeToDigits(session.phone);
+        } else {
+          sendTarget = null; // we'll avoid trying to send to a non-numeric guest id
+        }
 
         // (dialog rules — same as before)
-        if (session.phone && session.phone.startsWith('guest_') && session.state !== 'awaiting_phone') {
+        if (session.phone && String(session.phone).startsWith('guest_') && session.state !== 'awaiting_phone') {
           session.state = 'awaiting_phone';
           await session.save();
 
@@ -310,11 +337,18 @@ router.post('/webhook', async (req, res) => {
           const outgoing = await saveOutgoing(session.phone, replyText, {
             replyTo: smsDoc._id,
             webhookData: msgData,
-            deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+            deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES,
+            sendTo: sendTarget || session.phone,
+            initialStatus: sendTarget ? 'pending' : 'pending'
           });
 
-          // 3) send asynchronously to gateway — gateway -> user
-          setImmediate(() => runSend(outgoing._id, session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+          // only attempt to send if we have a numeric destination
+          if (sendTarget) {
+            setImmediate(() => runSend(outgoing._id, sendTarget, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+          } else {
+            // mark smsApiResult to indicate no numeric destination available
+            await SMS.findByIdAndUpdate(outgoing._id, { $set: { smsApiResult: { note: 'awaiting numeric phone from user' } } });
+          }
 
           // link reply
           try { await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: outgoing._id } }); } catch (e) { console.warn('Failed to push reply id', e); }
@@ -358,10 +392,12 @@ router.post('/webhook', async (req, res) => {
             const out = await saveOutgoing(session.phone, replyText, {
               replyTo: smsDoc._id,
               webhookData: msgData,
-              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES,
+              sendTo: normalizedNewPhone
             });
 
-            setImmediate(() => runSend(out._id, session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+            // attempt send now that we have numeric phone
+            setImmediate(() => runSend(out._id, normalizedNewPhone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
 
             try { await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: out._id } }); } catch (e) { console.warn('Failed to push reply id', e); }
 
@@ -372,9 +408,16 @@ router.post('/webhook', async (req, res) => {
             const out = await saveOutgoing(session.phone, replyText, {
               replyTo: smsDoc._id,
               webhookData: msgData,
-              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES,
+              sendTo: sendTarget || session.phone
             });
-            setImmediate(() => runSend(out._id, session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+
+            if (sendTarget) {
+              setImmediate(() => runSend(out._id, sendTarget, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+            } else {
+              await SMS.findByIdAndUpdate(out._id, { $set: { smsApiResult: { note: 'awaiting valid phone from user' } } });
+            }
+
             try { await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: out._id } }); } catch (e) { console.warn('Failed to push reply id', e); }
             results.push({ success: true, message: 'Awaiting valid phone number', data: { incomingId: smsDoc._id, outgoingId: out._id, reply: replyText } });
             continue;
@@ -465,11 +508,17 @@ router.post('/webhook', async (req, res) => {
         const outgoing = await saveOutgoing(session.phone, replyText, {
           replyTo: smsDoc._id,
           webhookData: msgData,
-          deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+          deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES,
+          sendTo: sendTarget || session.phone
         });
 
-        // send async to gateway — gateway will deliver to phone
-        setImmediate(() => runSend(outgoing._id, session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+        // send async to gateway only if we have a numeric destination
+        if (sendTarget) {
+          setImmediate(() => runSend(outgoing._id, sendTarget, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES));
+        } else {
+          // annotate outgoing so it's clear in the DB that we didn't attempt external send
+          await SMS.findByIdAndUpdate(outgoing._id, { $set: { smsApiResult: { note: 'no numeric destination available; awaiting user phone' } } });
+        }
 
         try { await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: outgoing._id } }); } catch (e) { console.warn('Failed to push reply id into incoming sms.replies', e); }
 
@@ -516,7 +565,7 @@ router.post('/gateway-test', async (req, res) => {
     const { phone, message, devices } = req.body;
     if (!phone || !message) return res.status(400).json({ success: false, error: 'Missing phone or message' });
 
-    const temp = await saveOutgoing(phone, message, { webhookData: { test: true } });
+    const temp = await saveOutgoing(phone, message, { webhookData: { test: true }, sendTo: normalizeToDigits(phone) });
     const result = await sendSMS(phone, message, devices || SENSOR_API_DEFAULT_DEVICES);
     await SMS.findByIdAndUpdate(temp._id, { $set: { smsApiResult: result, status: result.success ? 'sent' : 'failed', messageId: result.messageId || temp.messageId } });
 
@@ -552,10 +601,15 @@ router.post('/booking-notification', async (req, res) => {
     const outgoing = await saveOutgoing(phone, message, {
       replyTo: null,
       webhookData: { bookingId, status },
-      deviceId: undefined
+      deviceId: undefined,
+      sendTo: normalizeToDigits(phone)
     });
 
-    setImmediate(() => runSend(outgoing._id, phone, message, undefined));
+    if (isValidPhoneDigits(normalizeToDigits(phone))) {
+      setImmediate(() => runSend(outgoing._id, normalizeToDigits(phone), message, undefined));
+    } else {
+      await SMS.findByIdAndUpdate(outgoing._id, { $set: { smsApiResult: { note: 'invalid phone for booking-notification' }, status: 'failed' } });
+    }
 
     res.json({ success: true, message: 'Notification queued', smsId: outgoing._id });
 
