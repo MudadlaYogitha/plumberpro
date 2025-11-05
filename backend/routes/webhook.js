@@ -10,7 +10,7 @@ const { Types: { ObjectId } } = require('mongoose');
 const router = express.Router();
 
 const BOOKING_LINK = process.env.FRONTEND_URL || 'http://localhost:5173';
-const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER || 'System';
+const SENDER_NUMBER = process.env.SMS_SENDER_NUMBER ;
 const SENSOR_API_BASE_URL = (process.env.SENSOR_API_BASE_URL || 'https://connect.sensorequation.com').replace(/\/+$/, '');
 const SENSOR_API_KEY = process.env.SENSOR_API_KEY || '2ec54b331580a35ce223e7aaec1872b0afe27465';
 const SENSOR_API_DEFAULT_DEVICES = process.env.SENSOR_API_DEFAULT_DEVICES || '3';
@@ -92,14 +92,18 @@ async function getOrCreateSession(phone) {
   return session;
 }
 
-async function saveOutgoing(phone, text) {
+// saveOutgoing now accepts options: { replyTo, webhookData, deviceId }
+async function saveOutgoing(phone, text, options = {}) {
   const out = new SMS({
     from: SENDER_NUMBER,
     to: phone,
     message: text,
     type: 'sent',
     status: 'pending',
-    messageId: `auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`
+    messageId: `auto_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    replyTo: options.replyTo || null,
+    webhookData: options.webhookData || undefined,
+    deviceId: options.deviceId || undefined
   });
   await out.save();
   return out;
@@ -291,7 +295,12 @@ router.post('/webhook', async (req, res) => {
 
           replyText = "Hi! I'm your PlumbPro assistant. To help you book a service, please reply with your phone number (e.g., 9123456789) so I can create a personalized booking link for you.";
 
-          const outgoing = await saveOutgoing(session.phone, replyText);
+          const outgoing = await saveOutgoing(session.phone, replyText, {
+            replyTo: smsDoc._id,
+            webhookData: msgData,
+            deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+          });
+
           const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
 
           // attach raw result to outgoing doc for debugging
@@ -299,6 +308,12 @@ router.post('/webhook', async (req, res) => {
           outgoing.status = smsResult.success ? 'sent' : 'failed';
           if (smsResult.messageId) outgoing.messageId = smsResult.messageId;
           await outgoing.save();
+
+          try {
+            await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: outgoing._id } });
+          } catch (e) {
+            console.warn('Failed to push reply id into incoming sms.replies', e);
+          }
 
           results.push({ success: true, message: 'SMS received and processed (awaiting phone)', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
           continue;
@@ -337,23 +352,43 @@ router.post('/webhook', async (req, res) => {
               replyText = `Perfect! Your phone number ${normalizedNewPhone} is saved. Which service do you need? For example: Plumbing, Drain cleaning, Water heater, Pipe repair, Bathroom fitting, Electrical, or Other.`;
             }
 
-            const out = await saveOutgoing(session.phone, replyText);
+            const out = await saveOutgoing(session.phone, replyText, {
+              replyTo: smsDoc._id,
+              webhookData: msgData,
+              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+            });
             const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
             out.smsApiResult = smsResult;
             out.status = smsResult.success ? 'sent' : 'failed';
             if (smsResult.messageId) out.messageId = smsResult.messageId;
             await out.save();
 
+            try {
+              await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: out._id } });
+            } catch (e) {
+              console.warn('Failed to push reply id into incoming sms.replies', e);
+            }
+
             results.push({ success: true, message: 'Phone received and processed', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
             continue;
           } else {
             replyText = "Please enter a valid phone number (digits only, e.g., 9123456789) so I can create your booking link.";
-            const out = await saveOutgoing(session.phone, replyText);
+            const out = await saveOutgoing(session.phone, replyText, {
+              replyTo: smsDoc._id,
+              webhookData: msgData,
+              deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+            });
             const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
             out.smsApiResult = smsResult;
             out.status = smsResult.success ? 'sent' : 'failed';
             if (smsResult.messageId) out.messageId = smsResult.messageId;
             await out.save();
+
+            try {
+              await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: out._id } });
+            } catch (e) {
+              console.warn('Failed to push reply id into incoming sms.replies', e);
+            }
 
             results.push({ success: true, message: 'Awaiting valid phone number', data: { id: smsDoc._id, from: smsDoc.from, to: smsDoc.to, message: smsDoc.message, reply: replyText, smsApiResult: smsResult } });
             continue;
@@ -444,12 +479,22 @@ router.post('/webhook', async (req, res) => {
           replyText = `Hi there! 👋 I'm here to help with your plumbing needs.\n\nSay "Help" to book a service, or describe what you need fixed. I'll take care of the rest! 🔧`;
         }
 
-        const outgoing = await saveOutgoing(session.phone, replyText);
+        const outgoing = await saveOutgoing(session.phone, replyText, {
+          replyTo: smsDoc._id,
+          webhookData: msgData,
+          deviceId: msgData.deviceID || SENSOR_API_DEFAULT_DEVICES
+        });
         const smsResult = await sendSMS(session.phone, replyText, msgData.deviceID || SENSOR_API_DEFAULT_DEVICES);
         outgoing.smsApiResult = smsResult;
         outgoing.status = smsResult.success ? 'sent' : 'failed';
         if (smsResult.messageId) outgoing.messageId = smsResult.messageId;
         await outgoing.save();
+
+        try {
+          await SMS.updateOne({ _id: smsDoc._id }, { $push: { replies: outgoing._id } });
+        } catch (e) {
+          console.warn('Failed to push reply id into incoming sms.replies', e);
+        }
 
         await session.save();
 
@@ -525,7 +570,11 @@ router.post('/booking-notification', async (req, res) => {
         message = `📱 Update on your plumbing service:\n\nStatus: ${status.replace('_', ' ')}\n🔍 Full details: ${loginLink}\n\nQuestions? Just reply here! 🔧`;
     }
 
-    const outgoing = await saveOutgoing(phone, message);
+    const outgoing = await saveOutgoing(phone, message, {
+      replyTo: null,
+      webhookData: { bookingId, status },
+      deviceId: undefined
+    });
     const smsResult = await sendSMS(phone, message, undefined);
     outgoing.smsApiResult = smsResult;
     if (smsResult.success) { outgoing.status = 'sent'; outgoing.messageId = smsResult.messageId; } else { outgoing.status = 'failed'; }
